@@ -46,12 +46,10 @@ const DB_NAME = 'loop-player-db'
 const STORE_NAME = 'settings'
 const HANDLE_KEY = 'last-file-handle'
 
-let fileUrl = null
 let selectedFile = null
 let mediaSource = null
 let sourceBuffer = null
 let mseChunk = null
-let mseUrl = null
 let wakeLock = null
 let recovering = false
 let frameWatcherActive = false
@@ -111,31 +109,19 @@ async function dbGet(key) {
   })
 }
 
-function revokeFileUrl() {
-  if (fileUrl) {
-    URL.revokeObjectURL(fileUrl)
-    fileUrl = null
+function setVideoSourceObject(sourceObject) {
+  if (!sourceObject) {
+    throw new Error('Missing video source object.')
   }
-}
-
-function revokeMseUrl() {
-  if (mseUrl) {
-    URL.revokeObjectURL(mseUrl)
-    mseUrl = null
-  }
-}
-
-function setSafeVideoSource(url) {
-  if (typeof url !== 'string' || !url.startsWith('blob:')) {
-    throw new Error('Unsafe video source URL.')
-  }
-  player.src = url
+  player.srcObject = sourceObject
 }
 
 function teardownMse() {
   sourceBuffer = null
   mseChunk = null
-  revokeMseUrl()
+  if (player.srcObject === mediaSource) {
+    player.srcObject = null
+  }
 
   if (mediaSource) {
     mediaSource.onsourceopen = null
@@ -209,15 +195,14 @@ async function setupMsePlayback(file) {
     }
 
     player.removeAttribute('loop')
-    mseUrl = URL.createObjectURL(mediaSource)
-    setSafeVideoSource(mseUrl)
+    setVideoSourceObject(mediaSource)
   })
 }
 
 function setupNativePlayback() {
   teardownMse()
   player.setAttribute('loop', '')
-  setSafeVideoSource(fileUrl)
+  setVideoSourceObject(selectedFile)
   modeStatus.textContent = 'Native <video loop>'
 }
 
@@ -258,9 +243,6 @@ async function setSelectedFile(file, handle = null) {
   selectedFile = file
   setFileName(file)
   setStatus('Ready')
-
-  revokeFileUrl()
-  fileUrl = URL.createObjectURL(file)
 
   if (handle && 'indexedDB' in window) {
     try {
@@ -428,7 +410,6 @@ document.addEventListener('visibilitychange', () => {
 
 window.addEventListener('beforeunload', () => {
   releaseWakeLock()
-  revokeFileUrl()
 })
 
 restoreFileFromDb()
