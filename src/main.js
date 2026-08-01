@@ -127,7 +127,7 @@ function setVideoSource(source) {
       throw new Error('Unexpected URL scheme from createObjectURL.')
     }
     currentObjectUrl = blobUrl
-    player.src = currentObjectUrl
+    player.src = currentObjectUrl // lgtm[js/xss-through-dom]
   } else if (!source) {
     player.srcObject = null
     player.src = ''
