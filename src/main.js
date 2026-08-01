@@ -51,6 +51,7 @@ let selectedFile = null
 let mediaSource = null
 let sourceBuffer = null
 let mseChunk = null
+let mseUrl = null
 let wakeLock = null
 let recovering = false
 let frameWatcherActive = false
@@ -117,9 +118,24 @@ function revokeFileUrl() {
   }
 }
 
+function revokeMseUrl() {
+  if (mseUrl) {
+    URL.revokeObjectURL(mseUrl)
+    mseUrl = null
+  }
+}
+
+function setSafeVideoSource(url) {
+  if (typeof url !== 'string' || !url.startsWith('blob:')) {
+    throw new Error('Unsafe video source URL.')
+  }
+  player.src = url
+}
+
 function teardownMse() {
   sourceBuffer = null
   mseChunk = null
+  revokeMseUrl()
 
   if (mediaSource) {
     mediaSource.onsourceopen = null
@@ -193,14 +209,15 @@ async function setupMsePlayback(file) {
     }
 
     player.removeAttribute('loop')
-    player.src = URL.createObjectURL(mediaSource)
+    mseUrl = URL.createObjectURL(mediaSource)
+    setSafeVideoSource(mseUrl)
   })
 }
 
 function setupNativePlayback() {
   teardownMse()
   player.setAttribute('loop', '')
-  player.src = fileUrl
+  setSafeVideoSource(fileUrl)
   modeStatus.textContent = 'Native <video loop>'
 }
 
