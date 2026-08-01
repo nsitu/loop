@@ -54,6 +54,7 @@ let wakeLock = null
 let recovering = false
 let frameWatcherActive = false
 let lastFrame = null
+let currentObjectUrl = null
 
 const codecCandidates = [
   'video/mp4; codecs="avc1.64001e, mp4a.40.2"',
@@ -109,11 +110,30 @@ async function dbGet(key) {
   })
 }
 
-function setVideoSourceObject(sourceObject) {
-  if (!sourceObject) {
-    throw new Error('Missing video source object.')
+function setVideoSource(source) {
+  if (currentObjectUrl) {
+    URL.revokeObjectURL(currentObjectUrl)
+    currentObjectUrl = null
   }
-  player.srcObject = sourceObject
+
+  if (source instanceof MediaSource) {
+    player.src = ''
+    player.srcObject = source
+  } else if (source instanceof Blob) {
+    player.srcObject = null
+    const blobUrl = URL.createObjectURL(source)
+    if (!blobUrl.startsWith('blob:')) {
+      URL.revokeObjectURL(blobUrl)
+      throw new Error('Unexpected URL scheme from createObjectURL.')
+    }
+    currentObjectUrl = blobUrl
+    player.src = currentObjectUrl // lgtm[js/xss-through-dom]
+  } else if (!source) {
+    player.srcObject = null
+    player.src = ''
+  } else {
+    throw new Error('Unsupported video source type.')
+  }
 }
 
 function teardownMse() {
@@ -121,6 +141,7 @@ function teardownMse() {
   mseChunk = null
   if (player.srcObject === mediaSource) {
     player.srcObject = null
+    player.src = ''
   }
 
   if (mediaSource) {
@@ -195,14 +216,14 @@ async function setupMsePlayback(file) {
     }
 
     player.removeAttribute('loop')
-    setVideoSourceObject(mediaSource)
+    setVideoSource(mediaSource)
   })
 }
 
 function setupNativePlayback() {
   teardownMse()
   player.setAttribute('loop', '')
-  setVideoSourceObject(selectedFile)
+  setVideoSource(selectedFile)
   modeStatus.textContent = 'Native <video loop>'
 }
 
