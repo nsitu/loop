@@ -121,11 +121,13 @@ function setVideoSource(source) {
     player.srcObject = source
   } else if (source instanceof Blob) {
     player.srcObject = null
-    currentObjectUrl = URL.createObjectURL(source)
+    const blobUrl = URL.createObjectURL(source)
+    if (!blobUrl.startsWith('blob:')) {
+      URL.revokeObjectURL(blobUrl)
+      throw new Error('Unexpected URL scheme from createObjectURL.')
+    }
+    currentObjectUrl = blobUrl
     player.src = currentObjectUrl
-  } else if (typeof source === 'string') {
-    player.srcObject = null
-    player.src = source
   } else if (!source) {
     player.srcObject = null
     player.src = ''
