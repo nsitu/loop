@@ -1,0 +1,80 @@
+:root {
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  color: #e6edf3;
+  background: #0d1117;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+.layout {
+  width: min(980px, 100%);
+  margin: 0 auto;
+  padding: 1.25rem;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(1.4rem, 3vw, 2rem);
+}
+
+.hint {
+  margin-top: 0.5rem;
+  color: #9fb0c3;
+}
+
+.controls {
+  margin-top: 1rem;
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  align-items: end;
+}
+
+.file-input {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+input,
+select,
+button {
+  font: inherit;
+  padding: 0.55rem 0.65rem;
+  border-radius: 0.5rem;
+  border: 1px solid #30363d;
+  color: inherit;
+  background: #161b22;
+}
+
+button {
+  cursor: pointer;
+}
+
+video {
+  width: 100%;
+  margin-top: 1rem;
+  border-radius: 0.75rem;
+  background: #000;
+}
+
+.status {
+  margin-top: 1rem;
+  display: grid;
+  gap: 0.25rem;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 0.75rem;
+  padding: 0.75rem;
+}
+
+.status p {
+  margin: 0;
+}
