@@ -223,6 +223,176 @@ async function releaseWakeLock(): Promise<void> {
 }
 
 // ──────────────────────────────────────────────
+// WebGL renderer
+// ──────────────────────────────────────────────
+
+class WebGLRenderer {
+  private readonly gl: WebGLRenderingContext
+  private readonly program: WebGLProgram
+  private readonly buffer: WebGLBuffer
+  private readonly texture: WebGLTexture
+  private readonly positionLocation: number
+  private readonly texCoordLocation: number
+
+  constructor(
+    private readonly canvas: HTMLCanvasElement,
+    private readonly videoWidth: number,
+    private readonly videoHeight: number,
+  ) {
+    const gl = canvas.getContext('webgl', {
+      alpha: false,
+      antialias: false,
+      preserveDrawingBuffer: false,
+    })
+    if (!gl) throw new Error('WebGL is not available in this browser.')
+    this.gl = gl
+
+    const vertexShader = this.createShader(gl.VERTEX_SHADER, `
+      attribute vec2 a_position;
+      attribute vec2 a_texCoord;
+      varying vec2 v_texCoord;
+
+      void main() {
+        gl_Position = vec4(a_position, 0.0, 1.0);
+        v_texCoord = a_texCoord;
+      }
+    `)
+    const fragmentShader = this.createShader(gl.FRAGMENT_SHADER, `
+      precision mediump float;
+      uniform sampler2D u_texture;
+      varying vec2 v_texCoord;
+
+      void main() {
+        gl_FragColor = texture2D(u_texture, v_texCoord);
+      }
+    `)
+
+    const program = gl.createProgram()
+    if (!program) throw new Error('Could not create the WebGL program.')
+    gl.attachShader(program, vertexShader)
+    gl.attachShader(program, fragmentShader)
+    gl.linkProgram(program)
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(`Could not link the WebGL program: ${gl.getProgramInfoLog(program) ?? 'unknown error'}`)
+    }
+    gl.deleteShader(vertexShader)
+    gl.deleteShader(fragmentShader)
+    this.program = program
+
+    const buffer = gl.createBuffer()
+    const texture = gl.createTexture()
+    if (!buffer || !texture) throw new Error('Could not create WebGL rendering resources.')
+    this.buffer = buffer
+    this.texture = texture
+
+    this.positionLocation = gl.getAttribLocation(program, 'a_position')
+    this.texCoordLocation = gl.getAttribLocation(program, 'a_texCoord')
+    if (this.positionLocation < 0 || this.texCoordLocation < 0) {
+      throw new Error('Could not find WebGL shader attributes.')
+    }
+
+    gl.useProgram(program)
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
+    gl.enableVertexAttribArray(this.positionLocation)
+    gl.enableVertexAttribArray(this.texCoordLocation)
+    gl.vertexAttribPointer(this.positionLocation, 2, gl.FLOAT, false, 16, 0)
+    gl.vertexAttribPointer(this.texCoordLocation, 2, gl.FLOAT, false, 16, 8)
+
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, texture)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    gl.uniform1i(gl.getUniformLocation(program, 'u_texture'), 0)
+    gl.viewport(0, 0, canvas.width, canvas.height)
+    gl.clearColor(0, 0, 0, 1)
+  }
+
+  render(sample: VideoSample, uploadSample: boolean): void {
+    const gl = this.gl
+    gl.useProgram(this.program)
+
+    if (uploadSample) {
+      const frame = sample.toVideoFrame()
+      try {
+        gl.bindTexture(gl.TEXTURE_2D, this.texture)
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true)
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          frame as unknown as TexImageSource,
+        )
+      } finally {
+        frame.close()
+      }
+    }
+
+    const vAspect = this.videoWidth / this.videoHeight
+    const cAspect = this.canvas.width / this.canvas.height
+    let dx = 0, dy = 0, dw = this.canvas.width, dh = this.canvas.height
+    if (cAspect > vAspect) {
+      dw = this.canvas.height * vAspect
+      dx = (this.canvas.width - dw) / 2
+    } else {
+      dh = this.canvas.width / vAspect
+      dy = (this.canvas.height - dh) / 2
+    }
+
+    const left = (dx / this.canvas.width) * 2 - 1
+    const right = ((dx + dw) / this.canvas.width) * 2 - 1
+    const top = 1 - (dy / this.canvas.height) * 2
+    const bottom = 1 - ((dy + dh) / this.canvas.height) * 2
+    const textureCoordinates = this.textureCoordinates(sample.rotation)
+    const vertices = new Float32Array([
+      left, bottom, textureCoordinates[0], textureCoordinates[1],
+      right, bottom, textureCoordinates[2], textureCoordinates[3],
+      left, top, textureCoordinates[4], textureCoordinates[5],
+      right, top, textureCoordinates[6], textureCoordinates[7],
+    ])
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer)
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.DYNAMIC_DRAW)
+    gl.clear(gl.COLOR_BUFFER_BIT)
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+  }
+
+  dispose(): void {
+    this.gl.deleteTexture(this.texture)
+    this.gl.deleteBuffer(this.buffer)
+    this.gl.deleteProgram(this.program)
+  }
+
+  private textureCoordinates(rotation: VideoSample['rotation']): number[] {
+    switch (rotation) {
+      case 90:
+        return [1, 0, 1, 1, 0, 0, 0, 1]
+      case 180:
+        return [1, 1, 0, 1, 1, 0, 0, 0]
+      case 270:
+        return [0, 1, 0, 0, 1, 1, 1, 0]
+      default:
+        return [0, 0, 1, 0, 0, 1, 1, 1]
+    }
+  }
+
+  private createShader(type: number, source: string): WebGLShader {
+    const shader = this.gl.createShader(type)
+    if (!shader) throw new Error('Could not create a WebGL shader.')
+    this.gl.shaderSource(shader, source)
+    this.gl.compileShader(shader)
+    if (!this.gl.getShaderParameter(shader, this.gl.COMPILE_STATUS)) {
+      const log = this.gl.getShaderInfoLog(shader) ?? 'unknown error'
+      this.gl.deleteShader(shader)
+      throw new Error(`Could not compile the WebGL shader: ${log}`)
+    }
+    return shader
+  }
+}
+
 // SeamlessLoopPlayer
 // ──────────────────────────────────────────────
 //
@@ -249,6 +419,8 @@ async function releaseWakeLock(): Promise<void> {
 
 const PREFETCH_SEC = 1.0   // start next-loop decode this many seconds before end
 const MAX_AHEAD_SEC = 3.0  // max seconds of decoded frames to keep in memory
+const FULL_LOOP_MAX_DURATION_SEC = 12
+const FULL_LOOP_MEMORY_BUDGET_BYTES = 256 * 1024 * 1024
 
 class SeamlessLoopPlayer {
   private readonly videoTrack: InputVideoTrack
@@ -256,10 +428,12 @@ class SeamlessLoopPlayer {
   private readonly videoWidth: number
   private readonly videoHeight: number
   private readonly canvas: HTMLCanvasElement
-  private readonly ctx: CanvasRenderingContext2D
+  private readonly renderer: WebGLRenderer
 
   /** Shared, time-ordered queue of decoded frames. */
   private queue: Array<{ sample: VideoSample; playbackTime: number }> = []
+  /** Reused decoded frames for short loops that fit the memory budget. */
+  private fullLoopSamples: VideoSample[] | null = null
 
   private playing = false
   /** performance.now() timestamp when playback started. */
@@ -284,13 +458,10 @@ class SeamlessLoopPlayer {
     this.videoWidth = videoWidth
     this.videoHeight = videoHeight
     this.canvas = canvas
-
-    const ctx = canvas.getContext('2d')
-    if (!ctx) throw new Error('Could not acquire 2D canvas context.')
-    this.ctx = ctx
+    this.renderer = new WebGLRenderer(canvas, videoWidth, videoHeight)
   }
 
-  start(): void {
+  async start(): Promise<void> {
     this.playing = true
     this.startTime = performance.now()
     this.lastRenderedLoopIndex = -1
@@ -298,9 +469,11 @@ class SeamlessLoopPlayer {
     this.lastDrawnSample = null
     this.frameRateMonitor.reset()
 
-    // Kick off the first producer pipeline.  Each producer spawns the next one
-    // automatically when it nears its end.
-    void this.startProducer(0)
+    // Short loops are decoded once and reused, avoiding decoder churn at every
+    // boundary. Larger loops use the streaming producer pipeline.
+    const buffered = await this.tryPredecodeLoop()
+    if (!this.playing) return
+    if (!buffered) void this.startProducer(0)
 
     this.rafId = requestAnimationFrame(this.render)
   }
@@ -311,8 +484,15 @@ class SeamlessLoopPlayer {
 
     for (const { sample } of this.queue) sample.close()
     this.queue = []
+    for (const sample of this.fullLoopSamples ?? []) sample.close()
+    this.fullLoopSamples = null
     this.lastDrawnSample = null
+    this.renderer.dispose()
     this.frameRateMonitor.reset()
+  }
+
+  get isFullyBuffered(): boolean {
+    return this.fullLoopSamples !== null
   }
 
   getFrameRateSnapshot(): FrameRateSnapshot {
@@ -346,7 +526,7 @@ class SeamlessLoopPlayer {
         }
 
         const pt = loopOffset + sample.timestamp
-        this.queue.push({ sample, playbackTime: pt })
+        this.insertIntoQueue({ sample, playbackTime: pt })
 
         // Pre-warm the next loop's decoder pipeline
         if (!prefetchStarted && sample.timestamp >= this.duration - PREFETCH_SEC) {
@@ -371,23 +551,33 @@ class SeamlessLoopPlayer {
     const t = this.now
 
     // Find the latest frame with playbackTime ≤ t.
-    // The queue is maintained in insertion order which is chronological because
-    // each producer pushes frames in ascending timestamp order and the next
-    // producer starts at a higher offset than the current one.
+    // The queue is explicitly timestamp ordered because the producers overlap.
     let bestIdx = -1
-    for (let i = 0; i < this.queue.length; i++) {
-      if (this.queue[i].playbackTime <= t) {
-        bestIdx = i
-      } else {
-        break
+    let sampleToRender: VideoSample | null = null
+    let playbackTime = 0
+
+    if (this.fullLoopSamples) {
+      const fullLoopFrame = this.frameFromFullLoop(t)
+      if (fullLoopFrame) {
+        sampleToRender = fullLoopFrame.sample
+        playbackTime = fullLoopFrame.playbackTime
+      }
+    } else {
+      // The queue is timestamp ordered even while the two producers overlap.
+      for (let i = 0; i < this.queue.length; i++) {
+        if (this.queue[i].playbackTime <= t) bestIdx = i
+        else break
+      }
+      if (bestIdx >= 0) {
+        sampleToRender = this.queue[bestIdx].sample
+        playbackTime = this.queue[bestIdx].playbackTime
       }
     }
 
     let displayedNewFrame = false
-    if (bestIdx >= 0) {
-      const { sample, playbackTime } = this.queue[bestIdx]
-      displayedNewFrame = sample !== this.lastDrawnSample
-      this.lastDrawnSample = sample
+    if (sampleToRender) {
+      displayedNewFrame = sampleToRender !== this.lastDrawnSample
+      this.lastDrawnSample = sampleToRender
 
       // Detect and measure loop-boundary crossings
       const loopIdx = Math.floor(playbackTime / this.duration)
@@ -397,18 +587,21 @@ class SeamlessLoopPlayer {
       }
       this.lastRenderedLoopIndex = Math.max(this.lastRenderedLoopIndex, loopIdx)
 
-      // Draw with letterbox / pillarbox to fill the canvas
-      this.drawFit(sample)
+      this.renderer.render(sampleToRender, displayedNewFrame)
 
       // Release frames we've advanced past to free GPU memory
-      for (let i = 0; i < bestIdx; i++) {
-        this.queue[i].sample.close()
+      if (bestIdx > 0) {
+        for (let i = 0; i < bestIdx; i++) {
+          this.queue[i].sample.close()
+        }
+        this.queue.splice(0, bestIdx)
       }
-      this.queue.splice(0, bestIdx)
     }
 
     const lastQueuedFrame = this.queue[this.queue.length - 1]
-    const bufferAheadSec = lastQueuedFrame
+    const bufferAheadSec = this.fullLoopSamples
+      ? this.duration
+      : lastQueuedFrame
       ? Math.max(0, lastQueuedFrame.playbackTime - t)
       : 0
     this.frameRateMonitor.record(timestamp, displayedNewFrame, bufferAheadSec)
@@ -416,29 +609,96 @@ class SeamlessLoopPlayer {
     this.rafId = requestAnimationFrame(this.render)
   }
 
-  /**
-   * Draws `sample` centred in the canvas, preserving the video's aspect ratio
-   * (letterbox or pillarbox as needed), with a black background.
-   */
-  private drawFit(sample: VideoSample): void {
-    const cw = this.canvas.width
-    const ch = this.canvas.height
-    const vAspect = this.videoWidth / this.videoHeight
-    const cAspect = cw / ch
+  private frameFromFullLoop(t: number): { sample: VideoSample; playbackTime: number } | null {
+    const samples = this.fullLoopSamples
+    if (!samples || samples.length === 0) return null
 
-    let dx = 0, dy = 0, dw = cw, dh = ch
-    if (cAspect > vAspect) {
-      dw = ch * vAspect
-      dx = (cw - dw) / 2
-    } else {
-      dh = cw / vAspect
-      dy = (ch - dh) / 2
+    let loopIndex = Math.floor(t / this.duration)
+    const localTime = t - loopIndex * this.duration
+    let low = 0
+    let high = samples.length
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      if (samples[middle].timestamp <= localTime) low = middle + 1
+      else high = middle
     }
 
-    this.ctx.fillStyle = '#000'
-    this.ctx.fillRect(0, 0, cw, ch)
-    sample.draw(this.ctx, dx, dy, dw, dh)
+    let sampleIndex = low - 1
+    if (sampleIndex < 0) {
+      sampleIndex = samples.length - 1
+      loopIndex -= 1
+    }
+
+    const sample = samples[sampleIndex]
+    return {
+      sample,
+      playbackTime: loopIndex * this.duration + sample.timestamp,
+    }
   }
+
+  /**
+   * Decode a short loop once when its actual decoded samples fit the memory
+   * budget. If it does not fit, release the temporary samples and stream it.
+   */
+  private async tryPredecodeLoop(): Promise<boolean> {
+    if (this.duration > FULL_LOOP_MAX_DURATION_SEC) return false
+
+    const sink = new VideoSampleSink(this.videoTrack)
+    const samples: VideoSample[] = []
+    let bytes = 0
+
+    try {
+      for await (const sample of sink.samples()) {
+        if (!this.playing) {
+          sample.close()
+          for (const queuedSample of samples) queuedSample.close()
+          return false
+        }
+
+        const sampleBytes = this.sampleAllocationSize(sample)
+        bytes += sampleBytes
+        if (bytes > FULL_LOOP_MEMORY_BUDGET_BYTES) {
+          sample.close()
+          for (const queuedSample of samples) queuedSample.close()
+          return false
+        }
+
+        if (sample.timestamp >= 0 && sample.timestamp < this.duration) {
+          samples.push(sample)
+        } else {
+          sample.close()
+        }
+      }
+
+      if (samples.length === 0) return false
+      this.fullLoopSamples = samples
+      return true
+    } catch {
+      for (const sample of samples) sample.close()
+      return false
+    }
+  }
+
+  private sampleAllocationSize(sample: VideoSample): number {
+    try {
+      return sample.allocationSize()
+    } catch {
+      return this.videoWidth * this.videoHeight * 4
+    }
+  }
+
+  /** Insert by timestamp because the two asynchronous producers can finish out of order. */
+  private insertIntoQueue(entry: { sample: VideoSample; playbackTime: number }): void {
+    let low = 0
+    let high = this.queue.length
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      if (this.queue[middle].playbackTime <= entry.playbackTime) low = middle + 1
+      else high = middle
+    }
+    this.queue.splice(low, 0, entry)
+  }
+
 }
 
 // ──────────────────────────────────────────────
@@ -524,7 +784,14 @@ async function loadFile(file: File): Promise<void> {
       videoTrack, duration, videoWidth, videoHeight, canvas,
     )
     currentPlayer = player
-    player.start()
+    setStatus('Preparing playback...')
+    await player.start()
+    if (currentPlayer !== player) return
+
+    const playbackMode = player.isFullyBuffered
+      ? 'full loop buffered'
+      : 'streaming decode'
+    setStatus(`Ready (${playbackMode})`)
 
     void requestWakeLock()
 
