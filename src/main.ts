@@ -29,6 +29,20 @@ document.querySelector('#app')!.innerHTML = `
       <p><strong>Loop boundary gap:</strong> <span id="loopGap">Waiting…</span></p>
       <p><strong>Status:</strong> <span id="statusText">Idle</span></p>
     </section>
+
+    <section class="diagnostics" aria-label="Playback diagnostics">
+      <div class="diagnostics-heading">
+        <h2>Frame-rate monitor</h2>
+        <span>updates every 500 ms</span>
+      </div>
+      <div class="metric-grid">
+        <div class="metric"><span>Render FPS</span><strong id="renderFps">—</strong><small>requestAnimationFrame</small></div>
+        <div class="metric"><span>Displayed FPS</span><strong id="displayedFps">—</strong><small>new video samples</small></div>
+        <div class="metric"><span>Frame time</span><strong id="frameTime">—</strong><small>median render interval</small></div>
+        <div class="metric"><span>Long frames</span><strong id="longFrames">—</strong><small>over 1.5× normal</small></div>
+        <div class="metric"><span>Decode-ahead</span><strong id="bufferAhead">—</strong><small>seconds queued</small></div>
+      </div>
+    </section>
   </main>
 `
 
@@ -40,6 +54,11 @@ const canvas = document.querySelector<HTMLCanvasElement>('#player')!
 const fileNameEl = document.querySelector<HTMLElement>('#fileName')!
 const loopGapEl = document.querySelector<HTMLElement>('#loopGap')!
 const statusEl = document.querySelector<HTMLElement>('#statusText')!
+const renderFpsEl = document.querySelector<HTMLElement>('#renderFps')!
+const displayedFpsEl = document.querySelector<HTMLElement>('#displayedFps')!
+const frameTimeEl = document.querySelector<HTMLElement>('#frameTime')!
+const longFramesEl = document.querySelector<HTMLElement>('#longFrames')!
+const bufferAheadEl = document.querySelector<HTMLElement>('#bufferAhead')!
 
 // ──────────────────────────────────────────────
 // Utilities
@@ -57,6 +76,86 @@ function setFileName(file: File | null) {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+type FrameRateSnapshot = {
+  renderFps: number | null
+  displayedFps: number | null
+  medianFrameTimeMs: number | null
+  longFrames: number | null
+  bufferAheadSec: number | null
+}
+
+/** Low-overhead rolling diagnostics for the canvas render loop. */
+class FrameRateMonitor {
+  private readonly windowMs = 2000
+  private renderTimestamps: number[] = []
+  private displayedTimestamps: number[] = []
+  private frameIntervals: Array<{ timestamp: number; interval: number }> = []
+  private lastRenderTimestamp: number | null = null
+  private bufferAheadSec: number | null = null
+
+  reset(): void {
+    this.renderTimestamps = []
+    this.displayedTimestamps = []
+    this.frameIntervals = []
+    this.lastRenderTimestamp = null
+    this.bufferAheadSec = null
+  }
+
+  record(timestamp: number, displayedNewFrame: boolean, bufferAheadSec: number): void {
+    this.renderTimestamps.push(timestamp)
+    if (displayedNewFrame) this.displayedTimestamps.push(timestamp)
+
+    if (this.lastRenderTimestamp !== null) {
+      this.frameIntervals.push({
+        timestamp,
+        interval: timestamp - this.lastRenderTimestamp,
+      })
+    }
+    this.lastRenderTimestamp = timestamp
+    this.bufferAheadSec = bufferAheadSec
+
+    const cutoff = timestamp - this.windowMs
+    while (this.renderTimestamps[0] < cutoff) this.renderTimestamps.shift()
+    while (this.displayedTimestamps[0] < cutoff) this.displayedTimestamps.shift()
+    while (this.frameIntervals.length > 0 && this.frameIntervals[0].timestamp < cutoff) {
+      this.frameIntervals.shift()
+    }
+  }
+
+  snapshot(): FrameRateSnapshot {
+    const renderFps = this.rate(this.renderTimestamps)
+    const displayedFps = this.rate(this.displayedTimestamps)
+    const intervals = this.frameIntervals.map(entry => entry.interval)
+    const medianFrameTimeMs = this.median(intervals)
+    const longFrames = medianFrameTimeMs === null
+      ? null
+      : intervals.filter(interval => interval > medianFrameTimeMs * 1.5).length
+
+    return {
+      renderFps,
+      displayedFps,
+      medianFrameTimeMs,
+      longFrames,
+      bufferAheadSec: this.bufferAheadSec,
+    }
+  }
+
+  private rate(timestamps: number[]): number | null {
+    if (timestamps.length < 2) return null
+    const elapsedMs = timestamps[timestamps.length - 1] - timestamps[0]
+    return elapsedMs > 0 ? ((timestamps.length - 1) * 1000) / elapsedMs : null
+  }
+
+  private median(values: number[]): number | null {
+    if (values.length === 0) return null
+    const sorted = [...values].sort((a, b) => a - b)
+    const middle = Math.floor(sorted.length / 2)
+    return sorted.length % 2 === 0
+      ? (sorted[middle - 1] + sorted[middle]) / 2
+      : sorted[middle]
+  }
 }
 
 // ──────────────────────────────────────────────
@@ -166,6 +265,8 @@ class SeamlessLoopPlayer {
   /** performance.now() timestamp when playback started. */
   private startTime = 0
   private rafId = 0
+  private readonly frameRateMonitor = new FrameRateMonitor()
+  private lastDrawnSample: VideoSample | null = null
 
   /** Loop-boundary gap measurement (ms). Negative = early, positive = late. */
   loopGapMs: number | null = null
@@ -194,6 +295,8 @@ class SeamlessLoopPlayer {
     this.startTime = performance.now()
     this.lastRenderedLoopIndex = -1
     this.loopGapMs = null
+    this.lastDrawnSample = null
+    this.frameRateMonitor.reset()
 
     // Kick off the first producer pipeline.  Each producer spawns the next one
     // automatically when it nears its end.
@@ -208,6 +311,12 @@ class SeamlessLoopPlayer {
 
     for (const { sample } of this.queue) sample.close()
     this.queue = []
+    this.lastDrawnSample = null
+    this.frameRateMonitor.reset()
+  }
+
+  getFrameRateSnapshot(): FrameRateSnapshot {
+    return this.frameRateMonitor.snapshot()
   }
 
   // ── Private helpers ──────────────────────────
@@ -256,7 +365,7 @@ class SeamlessLoopPlayer {
   }
 
   /** rAF callback: displays the frame whose playbackTime is closest to now. */
-  private render = (): void => {
+  private render = (timestamp: number): void => {
     if (!this.playing) return
 
     const t = this.now
@@ -274,8 +383,11 @@ class SeamlessLoopPlayer {
       }
     }
 
+    let displayedNewFrame = false
     if (bestIdx >= 0) {
       const { sample, playbackTime } = this.queue[bestIdx]
+      displayedNewFrame = sample !== this.lastDrawnSample
+      this.lastDrawnSample = sample
 
       // Detect and measure loop-boundary crossings
       const loopIdx = Math.floor(playbackTime / this.duration)
@@ -294,6 +406,12 @@ class SeamlessLoopPlayer {
       }
       this.queue.splice(0, bestIdx)
     }
+
+    const lastQueuedFrame = this.queue[this.queue.length - 1]
+    const bufferAheadSec = lastQueuedFrame
+      ? Math.max(0, lastQueuedFrame.playbackTime - t)
+      : 0
+    this.frameRateMonitor.record(timestamp, displayedNewFrame, bufferAheadSec)
 
     this.rafId = requestAnimationFrame(this.render)
   }
@@ -330,12 +448,42 @@ class SeamlessLoopPlayer {
 let currentPlayer: SeamlessLoopPlayer | null = null
 let currentInput: Input | null = null
 let loopGapIntervalId = 0
+let frameRateIntervalId = 0
+
+function updateFrameRateMonitor(player: SeamlessLoopPlayer): void {
+  const snapshot = player.getFrameRateSnapshot()
+  renderFpsEl.textContent = snapshot.renderFps === null
+    ? '—'
+    : `${snapshot.renderFps.toFixed(1)} fps`
+  displayedFpsEl.textContent = snapshot.displayedFps === null
+    ? '—'
+    : `${snapshot.displayedFps.toFixed(1)} fps`
+  frameTimeEl.textContent = snapshot.medianFrameTimeMs === null
+    ? '—'
+    : `${snapshot.medianFrameTimeMs.toFixed(1)} ms`
+  longFramesEl.textContent = snapshot.longFrames === null
+    ? '—'
+    : String(snapshot.longFrames)
+  bufferAheadEl.textContent = snapshot.bufferAheadSec === null
+    ? '—'
+    : `${snapshot.bufferAheadSec.toFixed(2)} s`
+}
+
+function resetFrameRateMonitor(): void {
+  renderFpsEl.textContent = '—'
+  displayedFpsEl.textContent = '—'
+  frameTimeEl.textContent = '—'
+  longFramesEl.textContent = '—'
+  bufferAheadEl.textContent = '—'
+}
 
 function teardown(): void {
   currentPlayer?.stop()
   currentPlayer = null
 
   clearInterval(loopGapIntervalId)
+  clearInterval(frameRateIntervalId)
+  resetFrameRateMonitor()
 
   currentInput?.dispose()
   currentInput = null
@@ -385,6 +533,10 @@ async function loadFile(file: File): Promise<void> {
       if (player.loopGapMs !== null) {
         loopGapEl.textContent = `${player.loopGapMs.toFixed(2)} ms`
       }
+    }, 500)
+
+    frameRateIntervalId = window.setInterval(() => {
+      updateFrameRateMonitor(player)
     }, 500)
   } catch (err) {
     setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`)

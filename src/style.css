@@ -104,3 +104,55 @@ button {
 .status p {
   margin: 0;
 }
+
+.diagnostics {
+  margin-top: 1rem;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 0.75rem;
+  padding: 0.75rem;
+}
+
+.diagnostics-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.diagnostics h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.diagnostics-heading > span,
+.metric small {
+  color: #8b949e;
+  font-size: 0.75rem;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 0.5rem;
+}
+
+.metric {
+  display: grid;
+  gap: 0.2rem;
+  min-width: 0;
+  padding: 0.55rem;
+  border: 1px solid #21262d;
+  border-radius: 0.5rem;
+}
+
+.metric span {
+  color: #9fb0c3;
+  font-size: 0.8rem;
+}
+
+.metric strong {
+  font-size: 1.15rem;
+  font-variant-numeric: tabular-nums;
+}
