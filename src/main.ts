@@ -417,8 +417,8 @@ class WebGLRenderer {
 // Back-pressure keeps memory usage bounded to at most MAX_AHEAD_SEC of frames.
 // ──────────────────────────────────────────────
 
-const PREFETCH_SEC = 1.0   // start next-loop decode this many seconds before end
-const MAX_AHEAD_SEC = 3.0  // max seconds of decoded frames to keep in memory
+const PREFETCH_SEC = 3.0   // start next-loop decode this many seconds before end
+const MAX_AHEAD_SEC = 6.0  // max seconds of decoded frames to keep in memory
 const FULL_LOOP_MAX_DURATION_SEC = 12
 const FULL_LOOP_MEMORY_BUDGET_BYTES = 256 * 1024 * 1024
 
