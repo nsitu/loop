@@ -39,7 +39,7 @@ document.querySelector('#app')!.innerHTML = `
         <div class="metric"><span>Render FPS</span><strong id="renderFps">—</strong><small>requestAnimationFrame</small></div>
         <div class="metric"><span>Displayed FPS</span><strong id="displayedFps">—</strong><small>new video samples</small></div>
         <div class="metric"><span>Frame time</span><strong id="frameTime">—</strong><small>median render interval</small></div>
-        <div class="metric"><span>Long frames</span><strong id="longFrames">—</strong><small>over 1.5× normal</small></div>
+        <div class="metric"><span>Long frames</span><strong id="longFrames">—</strong><small>rAF gap &gt; 1.5× median</small></div>
         <div class="metric"><span>Decode-ahead</span><strong id="bufferAhead">—</strong><small>seconds queued</small></div>
       </div>
     </section>
@@ -436,6 +436,8 @@ class SeamlessLoopPlayer {
   private fullLoopSamples: VideoSample[] | null = null
 
   private playing = false
+  private visibilityPaused = false
+  private producerGeneration = 0
   /** performance.now() timestamp when playback started. */
   private startTime = 0
   private rafId = 0
@@ -463,6 +465,8 @@ class SeamlessLoopPlayer {
 
   async start(): Promise<void> {
     this.playing = true
+    this.visibilityPaused = false
+    const generation = ++this.producerGeneration
     this.startTime = performance.now()
     this.lastRenderedLoopIndex = -1
     this.loopGapMs = null
@@ -473,22 +477,53 @@ class SeamlessLoopPlayer {
     // boundary. Larger loops use the streaming producer pipeline.
     const buffered = await this.tryPredecodeLoop()
     if (!this.playing) return
-    if (!buffered) void this.startProducer(0)
+    if (!buffered) void this.startProducer(0, 0, generation)
 
     this.rafId = requestAnimationFrame(this.render)
   }
 
   stop(): void {
     this.playing = false
+    this.visibilityPaused = false
+    this.producerGeneration += 1
     cancelAnimationFrame(this.rafId)
 
-    for (const { sample } of this.queue) sample.close()
-    this.queue = []
+    this.clearStreamingQueue()
     for (const sample of this.fullLoopSamples ?? []) sample.close()
     this.fullLoopSamples = null
     this.lastDrawnSample = null
     this.renderer.dispose()
     this.frameRateMonitor.reset()
+  }
+
+  pauseForVisibility(): void {
+    if (!this.playing || this.visibilityPaused) return
+    this.visibilityPaused = true
+    cancelAnimationFrame(this.rafId)
+  }
+
+  resumeFromVisibility(): void {
+    if (!this.playing || !this.visibilityPaused) return
+
+    this.visibilityPaused = false
+    const generation = ++this.producerGeneration
+    this.clearStreamingQueue()
+    this.lastDrawnSample = null
+    this.lastRenderedLoopIndex = Math.floor(this.now / this.duration)
+    this.frameRateMonitor.reset()
+
+    if (!this.fullLoopSamples) {
+      const currentTime = this.now
+      const loopIndex = Math.floor(currentTime / this.duration)
+      const loopOffset = loopIndex * this.duration
+      void this.startProducer(
+        loopOffset,
+        currentTime - loopOffset,
+        generation,
+      )
+    }
+
+    this.rafId = requestAnimationFrame(this.render)
   }
 
   get isFullyBuffered(): boolean {
@@ -514,13 +549,17 @@ class SeamlessLoopPlayer {
    * for `loopOffset + duration`, pre-warming the next loop's decoder so its
    * first frame is ready exactly when the loop boundary is crossed.
    */
-  private async startProducer(loopOffset: number): Promise<void> {
+  private async startProducer(
+    loopOffset: number,
+    startTimestamp: number,
+    generation: number,
+  ): Promise<void> {
     const sink = new VideoSampleSink(this.videoTrack)
     let prefetchStarted = false
 
     try {
-      for await (const sample of sink.samples()) {
-        if (!this.playing) {
+      for await (const sample of sink.samples(startTimestamp)) {
+        if (!this.isProducerActive(generation)) {
           sample.close()
           return
         }
@@ -531,13 +570,14 @@ class SeamlessLoopPlayer {
         // Pre-warm the next loop's decoder pipeline
         if (!prefetchStarted && sample.timestamp >= this.duration - PREFETCH_SEC) {
           prefetchStarted = true
-          void this.startProducer(loopOffset + this.duration)
+          void this.startProducer(loopOffset + this.duration, 0, generation)
         }
 
         // Back-pressure: don't decode further than MAX_AHEAD_SEC ahead
-        while (this.playing && pt > this.now + MAX_AHEAD_SEC) {
+        while (this.isProducerActive(generation) && pt > this.now + MAX_AHEAD_SEC) {
           await sleep(10)
         }
+        if (!this.isProducerActive(generation)) return
       }
     } catch {
       // Input disposed or video ended unexpectedly – exit cleanly
@@ -634,6 +674,17 @@ class SeamlessLoopPlayer {
       sample,
       playbackTime: loopIndex * this.duration + sample.timestamp,
     }
+  }
+
+  private isProducerActive(generation: number): boolean {
+    return this.playing
+      && !this.visibilityPaused
+      && generation === this.producerGeneration
+  }
+
+  private clearStreamingQueue(): void {
+    for (const { sample } of this.queue) sample.close()
+    this.queue = []
   }
 
   /**
@@ -895,8 +946,13 @@ fullscreenButton.addEventListener('click', async () => {
 })
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && currentPlayer) {
+  if (!currentPlayer) return
+
+  if (document.visibilityState === 'visible') {
+    currentPlayer.resumeFromVisibility()
     void requestWakeLock()
+  } else {
+    currentPlayer.pauseForVisibility()
   }
 })
 
