@@ -794,6 +794,7 @@ class SeamlessLoopPlayer {
   /** Reused decoded frames for short loops that fit the memory budget. */
   private fullLoopSamples: VideoSample[] | null = null
   private fullLoopMemoryBytes = 0
+  private predecodeMemoryBytes = 0
 
   private playing = false
   private visibilityPaused = false
@@ -850,6 +851,7 @@ class SeamlessLoopPlayer {
     for (const sample of this.fullLoopSamples ?? []) sample.close()
     this.fullLoopSamples = null
     this.fullLoopMemoryBytes = 0
+    this.predecodeMemoryBytes = 0
     this.lastDrawnSample = null
     this.renderer.dispose()
     this.frameRateMonitor.reset()
@@ -900,7 +902,9 @@ class SeamlessLoopPlayer {
 
   get fullLoopMemory(): { usedBytes: number; budgetBytes: number } {
     return {
-      usedBytes: this.fullLoopMemoryBytes,
+      usedBytes: this.playbackMode === 'preparing'
+        ? this.predecodeMemoryBytes
+        : this.fullLoopMemoryBytes,
       budgetBytes: TARGET_DEVICE.fullLoopMemoryBudgetBytes,
     }
   }
@@ -916,10 +920,12 @@ class SeamlessLoopPlayer {
     if (!this.playing || generation !== this.producerGeneration) return
 
     if (buffered) {
+      this.predecodeMemoryBytes = 0
       this.playbackMode = 'full-loop'
       return
     }
 
+    this.predecodeMemoryBytes = 0
     this.playbackMode = 'streaming'
     void this.startProducer(0, 0, generation)
   }
@@ -1019,8 +1025,10 @@ class SeamlessLoopPlayer {
 
       // Release frames we've advanced past to free GPU memory
       if (bestIdx > 0) {
-        for (let i = 0; i < bestIdx; i++) {
-          this.queue[i].sample.close()
+        if (this.playbackMode !== 'preparing') {
+          for (let i = 0; i < bestIdx; i++) {
+            this.queue[i].sample.close()
+          }
         }
         this.queue.splice(0, bestIdx)
       }
@@ -1091,32 +1099,53 @@ class SeamlessLoopPlayer {
       for await (const sample of sink.samples()) {
         if (!this.isProducerActive(generation)) {
           sample.close()
-          for (const queuedSample of samples) queuedSample.close()
+          this.discardPredecodeCandidate(samples)
           return false
         }
 
         if (sample.timestamp >= 0 && sample.timestamp < this.duration) {
           const sampleBytes = this.sampleAllocationSize(sample)
           bytes += sampleBytes
+          this.predecodeMemoryBytes = bytes
           if (bytes > TARGET_DEVICE.fullLoopMemoryBudgetBytes) {
             sample.close()
-            for (const queuedSample of samples) queuedSample.close()
+            this.discardPredecodeCandidate(samples)
             return false
           }
           samples.push(sample)
+          // Make the first decoded frames available immediately while the
+          // full-loop candidate continues decoding in the background.
+          this.insertIntoQueue({ sample, playbackTime: sample.timestamp })
         } else {
           sample.close()
         }
       }
 
-      if (samples.length === 0) return false
+      if (samples.length === 0) {
+        this.predecodeMemoryBytes = 0
+        return false
+      }
       this.fullLoopSamples = samples
       this.fullLoopMemoryBytes = bytes
+      // The samples are now owned by fullLoopSamples rather than the queue.
+      const candidateSamples = new Set(samples)
+      this.queue = this.queue.filter(entry => !candidateSamples.has(entry.sample))
       return true
     } catch {
-      for (const sample of samples) sample.close()
+      this.discardPredecodeCandidate(samples)
       return false
     }
+  }
+
+  private discardPredecodeCandidate(samples: VideoSample[]): void {
+    const candidateSamples = new Set(samples)
+    this.queue = this.queue.filter(entry => {
+      if (!candidateSamples.has(entry.sample)) return true
+      entry.sample.close()
+      return false
+    })
+    for (const sample of samples) sample.close()
+    this.predecodeMemoryBytes = 0
   }
 
   private sampleAllocationSize(sample: VideoSample): number {
