@@ -11,6 +11,21 @@ Web-based local video player focused on seamless looping.
 - Experimental MSE continuous mode for fragmented MP4 (`fMP4`) files
 - Fullscreen toggle, wake-lock support, and playback auto-recovery
 
+## Renderer backends
+
+Playback uses WebGL2 by default, with WebGL1 fallback. The WebGL2 path keeps
+texture storage and quad geometry resident instead of reallocating them for
+each frame.
+
+WebGPU can be tested on a supported secure origin with:
+
+```text
+?renderer=webgpu
+```
+
+If WebGPU is unavailable, the explicit WebGPU mode reports an error rather
+than silently changing the renderer being measured.
+
 ## Development
 
 ```bash
