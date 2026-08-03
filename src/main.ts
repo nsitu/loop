@@ -70,6 +70,17 @@ function setStatus(msg: string) {
   statusEl.textContent = msg
 }
 
+function playbackStatus(player: SeamlessLoopPlayer): string {
+  switch (player.playbackState) {
+    case 'preparing':
+      return `Preparing playback (${player.rendererBackend})`
+    case 'streaming':
+      return `Playing (streaming decode, ${player.rendererBackend})`
+    case 'full-loop':
+      return `Playing (full loop buffered, ${(player.fullLoopMemory.usedBytes / MIB).toFixed(0)} MiB, ${player.rendererBackend})`
+  }
+}
+
 function setFileName(file: File | null) {
   fileNameEl.textContent = file
     ? `${file.name} (${Math.round(file.size / 1024)} KB)`
@@ -786,6 +797,7 @@ class SeamlessLoopPlayer {
 
   private playing = false
   private visibilityPaused = false
+  private playbackMode: 'preparing' | 'streaming' | 'full-loop' = 'preparing'
   private producerGeneration = 0
   /** performance.now() timestamp when playback started. */
   private startTime = 0
@@ -811,9 +823,10 @@ class SeamlessLoopPlayer {
     this.renderer = renderer
   }
 
-  async start(): Promise<void> {
+  start(): void {
     this.playing = true
     this.visibilityPaused = false
+    this.playbackMode = 'preparing'
     const generation = ++this.producerGeneration
     this.startTime = performance.now()
     this.lastRenderedLoopIndex = -1
@@ -821,13 +834,10 @@ class SeamlessLoopPlayer {
     this.lastDrawnSample = null
     this.frameRateMonitor.reset()
 
-    // Short loops are decoded once and reused, avoiding decoder churn at every
-    // boundary. Larger loops use the streaming producer pipeline.
-    const buffered = await this.tryPredecodeLoop()
-    if (!this.playing) return
-    if (!buffered) void this.startProducer(0, 0, generation)
-
+    // Start rendering and diagnostics immediately. Full-loop preparation can
+    // take a long time on Android and must not block the first status update.
     this.rafId = requestAnimationFrame(this.render)
+    void this.preparePlayback(generation)
   }
 
   stop(): void {
@@ -862,6 +872,7 @@ class SeamlessLoopPlayer {
     this.frameRateMonitor.reset()
 
     if (!this.fullLoopSamples) {
+      this.playbackMode = 'streaming'
       const currentTime = this.now
       const loopIndex = Math.floor(currentTime / this.duration)
       const loopOffset = loopIndex * this.duration
@@ -877,6 +888,10 @@ class SeamlessLoopPlayer {
 
   get isFullyBuffered(): boolean {
     return this.fullLoopSamples !== null
+  }
+
+  get playbackState(): 'preparing' | 'streaming' | 'full-loop' {
+    return this.playbackMode
   }
 
   get rendererBackend(): RendererBackend {
@@ -895,6 +910,19 @@ class SeamlessLoopPlayer {
   }
 
   // ── Private helpers ──────────────────────────
+
+  private async preparePlayback(generation: number): Promise<void> {
+    const buffered = await this.tryPredecodeLoop(generation)
+    if (!this.playing || generation !== this.producerGeneration) return
+
+    if (buffered) {
+      this.playbackMode = 'full-loop'
+      return
+    }
+
+    this.playbackMode = 'streaming'
+    void this.startProducer(0, 0, generation)
+  }
 
   /** Monotonic playback clock in seconds. */
   private get now(): number {
@@ -1054,14 +1082,14 @@ class SeamlessLoopPlayer {
    * decoded bytes per second vary substantially with pixel format and frame
    * rate.
    */
-  private async tryPredecodeLoop(): Promise<boolean> {
+  private async tryPredecodeLoop(generation: number): Promise<boolean> {
     const sink = new VideoSampleSink(this.videoTrack)
     const samples: VideoSample[] = []
     let bytes = 0
 
     try {
       for await (const sample of sink.samples()) {
-        if (!this.playing) {
+        if (!this.isProducerActive(generation)) {
           sample.close()
           for (const queuedSample of samples) queuedSample.close()
           return false
@@ -1140,9 +1168,11 @@ function updateFrameRateMonitor(player: SeamlessLoopPlayer): void {
     ? '—'
     : `${snapshot.bufferAheadSec.toFixed(2)} s`
   const memory = player.fullLoopMemory
-  fullLoopMemoryEl.textContent = player.isFullyBuffered
+  fullLoopMemoryEl.textContent = player.playbackState === 'full-loop'
     ? `${(memory.usedBytes / MIB).toFixed(0)} / ${(memory.budgetBytes / MIB).toFixed(0)} MiB`
-    : 'streaming'
+    : player.playbackState
+
+  if (currentPlayer === player) setStatus(playbackStatus(player))
 }
 
 function resetFrameRateMonitor(): void {
@@ -1157,6 +1187,7 @@ function resetFrameRateMonitor(): void {
 function teardown(): void {
   currentPlayer?.stop()
   currentPlayer = null
+  playerContainer.classList.remove('has-video')
 
   clearInterval(loopGapIntervalId)
   clearInterval(frameRateIntervalId)
@@ -1213,20 +1244,20 @@ async function loadFile(file: File): Promise<void> {
     // Set canvas pixel dimensions to match the video
     canvas.width = videoWidth
     canvas.height = videoHeight
+    playerContainer.style.setProperty(
+      '--video-aspect-ratio',
+      String(videoWidth / videoHeight),
+    )
+    playerContainer.classList.add('has-video')
 
     const renderer = await createRenderer(canvas, videoWidth, videoHeight)
     const player = new SeamlessLoopPlayer(
       videoTrack, duration, videoWidth, videoHeight, renderer,
     )
     currentPlayer = player
-    setStatus('Preparing playback...')
-    await player.start()
+    player.start()
     if (currentPlayer !== player) return
-
-    const playbackMode = player.isFullyBuffered
-      ? `full loop buffered (${(player.fullLoopMemory.usedBytes / MIB).toFixed(0)} MiB)`
-      : 'streaming decode'
-    setStatus(`Ready (${playbackMode}, ${player.rendererBackend})`)
+    setStatus(playbackStatus(player))
 
     void requestWakeLock()
 
