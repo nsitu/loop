@@ -28,6 +28,10 @@ document.querySelector('#app')!.innerHTML = `
       <p><strong>Loaded:</strong> <span id="fileName">None</span></p>
       <p><strong>Loop boundary gap:</strong> <span id="loopGap">Waiting…</span></p>
       <p><strong>Status:</strong> <span id="statusText">Idle</span></p>
+      <div id="preloadStatus" hidden>
+        <progress id="preloadProgress" max="1" value="0"></progress>
+        <span id="preloadProgressLabel">0%</span>
+      </div>
     </section>
 
     <section class="diagnostics" aria-label="Playback diagnostics">
@@ -55,6 +59,9 @@ const canvas = document.querySelector<HTMLCanvasElement>('#player')!
 const fileNameEl = document.querySelector<HTMLElement>('#fileName')!
 const loopGapEl = document.querySelector<HTMLElement>('#loopGap')!
 const statusEl = document.querySelector<HTMLElement>('#statusText')!
+const preloadStatusEl = document.querySelector<HTMLDivElement>('#preloadStatus')!
+const preloadProgressEl = document.querySelector<HTMLProgressElement>('#preloadProgress')!
+const preloadProgressLabelEl = document.querySelector<HTMLElement>('#preloadProgressLabel')!
 const renderFpsEl = document.querySelector<HTMLElement>('#renderFps')!
 const displayedFpsEl = document.querySelector<HTMLElement>('#displayedFps')!
 const frameTimeEl = document.querySelector<HTMLElement>('#frameTime')!
@@ -79,6 +86,24 @@ function playbackStatus(player: SeamlessLoopPlayer): string {
     case 'full-loop':
       return `Playing (full loop buffered, ${(player.fullLoopMemory.usedBytes / MIB).toFixed(0)} MiB, ${player.rendererBackend})`
   }
+}
+
+function resetPreloadProgress(): void {
+  preloadStatusEl.hidden = true
+  preloadProgressEl.value = 0
+  preloadProgressLabelEl.textContent = '0%'
+}
+
+function updatePreloadProgress(
+  player: SeamlessLoopPlayer,
+  progress: PreloadProgress,
+): void {
+  preloadStatusEl.hidden = false
+  preloadProgressEl.value = progress.fraction
+  preloadProgressLabelEl.textContent = `${(progress.fraction * 100).toFixed(0)}% · `
+    + `${progress.decodedSeconds.toFixed(1)} / ${progress.duration.toFixed(1)} s · `
+    + `${(progress.usedBytes / MIB).toFixed(0)} / ${(progress.budgetBytes / MIB).toFixed(0)} MiB`
+  setStatus(playbackStatus(player))
 }
 
 function setFileName(file: File | null) {
@@ -782,6 +807,14 @@ const TARGET_DEVICE = {
   fullLoopMemoryBudgetBytes: 512 * MIB,
 }
 
+type PreloadProgress = {
+  fraction: number
+  decodedSeconds: number
+  duration: number
+  usedBytes: number
+  budgetBytes: number
+}
+
 class SeamlessLoopPlayer {
   private readonly videoTrack: InputVideoTrack
   private readonly duration: number
@@ -824,7 +857,7 @@ class SeamlessLoopPlayer {
     this.renderer = renderer
   }
 
-  start(): void {
+  async start(onPreloadProgress?: (progress: PreloadProgress) => void): Promise<void> {
     this.playing = true
     this.visibilityPaused = false
     this.playbackMode = 'preparing'
@@ -835,10 +868,9 @@ class SeamlessLoopPlayer {
     this.lastDrawnSample = null
     this.frameRateMonitor.reset()
 
-    // Start rendering and diagnostics immediately. Full-loop preparation can
-    // take a long time on Android and must not block the first status update.
-    this.rafId = requestAnimationFrame(this.render)
-    void this.preparePlayback(generation)
+    await this.preparePlayback(generation, onPreloadProgress)
+    if (!this.playing || generation !== this.producerGeneration) return
+    if (!this.visibilityPaused) this.rafId = requestAnimationFrame(this.render)
   }
 
   stop(): void {
@@ -915,8 +947,11 @@ class SeamlessLoopPlayer {
 
   // ── Private helpers ──────────────────────────
 
-  private async preparePlayback(generation: number): Promise<void> {
-    const buffered = await this.tryPredecodeLoop(generation)
+  private async preparePlayback(
+    generation: number,
+    onPreloadProgress?: (progress: PreloadProgress) => void,
+  ): Promise<void> {
+    const buffered = await this.tryPredecodeLoop(generation, onPreloadProgress)
     if (!this.playing || generation !== this.producerGeneration) return
 
     if (buffered) {
@@ -998,10 +1033,14 @@ class SeamlessLoopPlayer {
       }
     } else {
       // The queue is timestamp ordered even while the two producers overlap.
-      for (let i = 0; i < this.queue.length; i++) {
-        if (this.queue[i].playbackTime <= t) bestIdx = i
-        else break
+      let low = 0
+      let high = this.queue.length
+      while (low < high) {
+        const middle = (low + high) >>> 1
+        if (this.queue[middle].playbackTime <= t) low = middle + 1
+        else high = middle
       }
+      bestIdx = low - 1
       if (bestIdx >= 0) {
         sampleToRender = this.queue[bestIdx].sample
         playbackTime = this.queue[bestIdx].playbackTime
@@ -1025,10 +1064,8 @@ class SeamlessLoopPlayer {
 
       // Release frames we've advanced past to free GPU memory
       if (bestIdx > 0) {
-        if (this.playbackMode !== 'preparing') {
-          for (let i = 0; i < bestIdx; i++) {
-            this.queue[i].sample.close()
-          }
+        for (let i = 0; i < bestIdx; i++) {
+          this.queue[i].sample.close()
         }
         this.queue.splice(0, bestIdx)
       }
@@ -1090,7 +1127,10 @@ class SeamlessLoopPlayer {
    * decoded bytes per second vary substantially with pixel format and frame
    * rate.
    */
-  private async tryPredecodeLoop(generation: number): Promise<boolean> {
+  private async tryPredecodeLoop(
+    generation: number,
+    onProgress?: (progress: PreloadProgress) => void,
+  ): Promise<boolean> {
     const sink = new VideoSampleSink(this.videoTrack)
     const samples: VideoSample[] = []
     let bytes = 0
@@ -1099,7 +1139,7 @@ class SeamlessLoopPlayer {
       for await (const sample of sink.samples()) {
         if (!this.isProducerActive(generation)) {
           sample.close()
-          this.discardPredecodeCandidate(samples)
+          for (const queuedSample of samples) queuedSample.close()
           return false
         }
 
@@ -1107,15 +1147,19 @@ class SeamlessLoopPlayer {
           const sampleBytes = this.sampleAllocationSize(sample)
           bytes += sampleBytes
           this.predecodeMemoryBytes = bytes
+          onProgress?.({
+            fraction: Math.min(1, sample.timestamp / this.duration),
+            decodedSeconds: sample.timestamp,
+            duration: this.duration,
+            usedBytes: bytes,
+            budgetBytes: TARGET_DEVICE.fullLoopMemoryBudgetBytes,
+          })
           if (bytes > TARGET_DEVICE.fullLoopMemoryBudgetBytes) {
             sample.close()
-            this.discardPredecodeCandidate(samples)
+            for (const queuedSample of samples) queuedSample.close()
             return false
           }
           samples.push(sample)
-          // Make the first decoded frames available immediately while the
-          // full-loop candidate continues decoding in the background.
-          this.insertIntoQueue({ sample, playbackTime: sample.timestamp })
         } else {
           sample.close()
         }
@@ -1127,25 +1171,11 @@ class SeamlessLoopPlayer {
       }
       this.fullLoopSamples = samples
       this.fullLoopMemoryBytes = bytes
-      // The samples are now owned by fullLoopSamples rather than the queue.
-      const candidateSamples = new Set(samples)
-      this.queue = this.queue.filter(entry => !candidateSamples.has(entry.sample))
       return true
     } catch {
-      this.discardPredecodeCandidate(samples)
+      for (const sample of samples) sample.close()
       return false
     }
-  }
-
-  private discardPredecodeCandidate(samples: VideoSample[]): void {
-    const candidateSamples = new Set(samples)
-    this.queue = this.queue.filter(entry => {
-      if (!candidateSamples.has(entry.sample)) return true
-      entry.sample.close()
-      return false
-    })
-    for (const sample of samples) sample.close()
-    this.predecodeMemoryBytes = 0
   }
 
   private sampleAllocationSize(sample: VideoSample): number {
@@ -1217,6 +1247,7 @@ function teardown(): void {
   currentPlayer?.stop()
   currentPlayer = null
   playerContainer.classList.remove('has-video')
+  resetPreloadProgress()
 
   clearInterval(loopGapIntervalId)
   clearInterval(frameRateIntervalId)
@@ -1284,8 +1315,11 @@ async function loadFile(file: File): Promise<void> {
       videoTrack, duration, videoWidth, videoHeight, renderer,
     )
     currentPlayer = player
-    player.start()
+    preloadStatusEl.hidden = false
+    setStatus(playbackStatus(player))
+    await player.start(progress => updatePreloadProgress(player, progress))
     if (currentPlayer !== player) return
+    resetPreloadProgress()
     setStatus(playbackStatus(player))
 
     void requestWakeLock()

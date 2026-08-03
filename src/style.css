@@ -116,6 +116,25 @@ button {
   margin: 0;
 }
 
+#preloadStatus {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+#preloadProgress {
+  flex: 1;
+  min-width: 0;
+  accent-color: #58a6ff;
+}
+
+#preloadProgressLabel {
+  min-width: 13rem;
+  color: #9fb0c3;
+  font-variant-numeric: tabular-nums;
+}
+
 .diagnostics {
   margin-top: 1rem;
   background: #161b22;
