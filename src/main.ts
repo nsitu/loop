@@ -41,6 +41,7 @@ document.querySelector('#app')!.innerHTML = `
         <div class="metric"><span>Frame time</span><strong id="frameTime">—</strong><small>median render interval</small></div>
         <div class="metric"><span>Long frames</span><strong id="longFrames">—</strong><small>rAF gap &gt; 1.5× median</small></div>
         <div class="metric"><span>Decode-ahead</span><strong id="bufferAhead">—</strong><small>seconds queued</small></div>
+        <div class="metric"><span>Full-loop memory</span><strong id="fullLoopMemory">—</strong><small>decoded sample allocation</small></div>
       </div>
     </section>
   </main>
@@ -59,6 +60,7 @@ const displayedFpsEl = document.querySelector<HTMLElement>('#displayedFps')!
 const frameTimeEl = document.querySelector<HTMLElement>('#frameTime')!
 const longFramesEl = document.querySelector<HTMLElement>('#longFrames')!
 const bufferAheadEl = document.querySelector<HTMLElement>('#bufferAhead')!
+const fullLoopMemoryEl = document.querySelector<HTMLElement>('#fullLoopMemory')!
 
 // ──────────────────────────────────────────────
 // Utilities
@@ -419,21 +421,35 @@ class WebGLRenderer {
 
 const PREFETCH_SEC = 3.0   // start next-loop decode this many seconds before end
 const MAX_AHEAD_SEC = 6.0  // max seconds of decoded frames to keep in memory
-const FULL_LOOP_MAX_DURATION_SEC = 12
-const FULL_LOOP_MEMORY_BUDGET_BYTES = 256 * 1024 * 1024
+const MIB = 1024 * 1024
+
+/**
+ * Profile for the photo-frame hardware this player is being tuned for.
+ *
+ * Total system RAM is not the same thing as the memory available to a
+ * Chromium/WebView renderer or to the video decoder. Keep a large reserve for
+ * Android, the browser, the WebGL context, and decoder overhead. This is an
+ * intentionally conservative starting point; increase it only after long
+ * soak tests on the target unit show that the process remains stable.
+ */
+const TARGET_DEVICE = {
+  name: 'Amlogic Cortex-A55 / Mali-G52 MC1 / 4 GB RAM',
+  totalRamBytes: 3817 * MIB,
+  fullLoopMemoryBudgetBytes: 512 * MIB,
+}
 
 class SeamlessLoopPlayer {
   private readonly videoTrack: InputVideoTrack
   private readonly duration: number
   private readonly videoWidth: number
   private readonly videoHeight: number
-  private readonly canvas: HTMLCanvasElement
   private readonly renderer: WebGLRenderer
 
   /** Shared, time-ordered queue of decoded frames. */
   private queue: Array<{ sample: VideoSample; playbackTime: number }> = []
   /** Reused decoded frames for short loops that fit the memory budget. */
   private fullLoopSamples: VideoSample[] | null = null
+  private fullLoopMemoryBytes = 0
 
   private playing = false
   private visibilityPaused = false
@@ -459,7 +475,6 @@ class SeamlessLoopPlayer {
     this.duration = duration
     this.videoWidth = videoWidth
     this.videoHeight = videoHeight
-    this.canvas = canvas
     this.renderer = new WebGLRenderer(canvas, videoWidth, videoHeight)
   }
 
@@ -491,6 +506,7 @@ class SeamlessLoopPlayer {
     this.clearStreamingQueue()
     for (const sample of this.fullLoopSamples ?? []) sample.close()
     this.fullLoopSamples = null
+    this.fullLoopMemoryBytes = 0
     this.lastDrawnSample = null
     this.renderer.dispose()
     this.frameRateMonitor.reset()
@@ -528,6 +544,13 @@ class SeamlessLoopPlayer {
 
   get isFullyBuffered(): boolean {
     return this.fullLoopSamples !== null
+  }
+
+  get fullLoopMemory(): { usedBytes: number; budgetBytes: number } {
+    return {
+      usedBytes: this.fullLoopMemoryBytes,
+      budgetBytes: TARGET_DEVICE.fullLoopMemoryBudgetBytes,
+    }
   }
 
   getFrameRateSnapshot(): FrameRateSnapshot {
@@ -688,12 +711,13 @@ class SeamlessLoopPlayer {
   }
 
   /**
-   * Decode a short loop once when its actual decoded samples fit the memory
-   * budget. If it does not fit, release the temporary samples and stream it.
+   * Decode a loop once when its actual decoded samples fit the device profile's
+   * memory budget. If it does not fit, release the temporary samples and stream
+   * it. The budget, rather than duration, is the important limit here because
+   * decoded bytes per second vary substantially with pixel format and frame
+   * rate.
    */
   private async tryPredecodeLoop(): Promise<boolean> {
-    if (this.duration > FULL_LOOP_MAX_DURATION_SEC) return false
-
     const sink = new VideoSampleSink(this.videoTrack)
     const samples: VideoSample[] = []
     let bytes = 0
@@ -706,15 +730,14 @@ class SeamlessLoopPlayer {
           return false
         }
 
-        const sampleBytes = this.sampleAllocationSize(sample)
-        bytes += sampleBytes
-        if (bytes > FULL_LOOP_MEMORY_BUDGET_BYTES) {
-          sample.close()
-          for (const queuedSample of samples) queuedSample.close()
-          return false
-        }
-
         if (sample.timestamp >= 0 && sample.timestamp < this.duration) {
+          const sampleBytes = this.sampleAllocationSize(sample)
+          bytes += sampleBytes
+          if (bytes > TARGET_DEVICE.fullLoopMemoryBudgetBytes) {
+            sample.close()
+            for (const queuedSample of samples) queuedSample.close()
+            return false
+          }
           samples.push(sample)
         } else {
           sample.close()
@@ -723,6 +746,7 @@ class SeamlessLoopPlayer {
 
       if (samples.length === 0) return false
       this.fullLoopSamples = samples
+      this.fullLoopMemoryBytes = bytes
       return true
     } catch {
       for (const sample of samples) sample.close()
@@ -778,6 +802,10 @@ function updateFrameRateMonitor(player: SeamlessLoopPlayer): void {
   bufferAheadEl.textContent = snapshot.bufferAheadSec === null
     ? '—'
     : `${snapshot.bufferAheadSec.toFixed(2)} s`
+  const memory = player.fullLoopMemory
+  fullLoopMemoryEl.textContent = player.isFullyBuffered
+    ? `${(memory.usedBytes / MIB).toFixed(0)} / ${(memory.budgetBytes / MIB).toFixed(0)} MiB`
+    : 'streaming'
 }
 
 function resetFrameRateMonitor(): void {
@@ -786,6 +814,7 @@ function resetFrameRateMonitor(): void {
   frameTimeEl.textContent = '—'
   longFramesEl.textContent = '—'
   bufferAheadEl.textContent = '—'
+  fullLoopMemoryEl.textContent = '—'
 }
 
 function teardown(): void {
@@ -840,7 +869,7 @@ async function loadFile(file: File): Promise<void> {
     if (currentPlayer !== player) return
 
     const playbackMode = player.isFullyBuffered
-      ? 'full loop buffered'
+      ? `full loop buffered (${(player.fullLoopMemory.usedBytes / MIB).toFixed(0)} MiB)`
       : 'streaming decode'
     setStatus(`Ready (${playbackMode})`)
 
