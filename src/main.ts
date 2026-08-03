@@ -116,6 +116,22 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function waitForPromiseOrTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  return new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => resolve(null), timeoutMs)
+    promise.then(
+      value => {
+        window.clearTimeout(timeoutId)
+        resolve(value)
+      },
+      error => {
+        window.clearTimeout(timeoutId)
+        reject(error)
+      },
+    )
+  })
+}
+
 type FrameRateSnapshot = {
   renderFps: number | null
   displayedFps: number | null
@@ -790,6 +806,7 @@ class WebGPURenderer implements FrameRenderer {
 
 const PREFETCH_SEC = 3.0   // start next-loop decode this many seconds before end
 const MAX_AHEAD_SEC = 6.0  // max seconds of decoded frames to keep in memory
+const PREDECODE_STALL_TIMEOUT_MS = 3000
 const MIB = 1024 * 1024
 
 /**
@@ -1136,7 +1153,24 @@ class SeamlessLoopPlayer {
     let bytes = 0
 
     try {
-      for await (const sample of sink.samples()) {
+      const iterator = sink.samples()[Symbol.asyncIterator]()
+      while (true) {
+        const nextResult = await waitForPromiseOrTimeout(
+          iterator.next(),
+          PREDECODE_STALL_TIMEOUT_MS,
+        )
+        if (nextResult === null) {
+          // A hardware decoder can stop producing when too many VideoFrames
+          // remain retained. Do not leave startup waiting forever; terminate
+          // this attempt and use the bounded streaming path instead.
+          void iterator.return?.()
+          for (const queuedSample of samples) queuedSample.close()
+          this.predecodeMemoryBytes = 0
+          return false
+        }
+        if (nextResult.done) break
+
+        const sample = nextResult.value
         if (!this.isProducerActive(generation)) {
           sample.close()
           for (const queuedSample of samples) queuedSample.close()
