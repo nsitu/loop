@@ -98,7 +98,9 @@ function playbackStatus(player: LoopPlayer): string {
     case 'full-loop':
       return `Playing (full loop buffered, ${(player.fullLoopMemory.usedBytes / MIB).toFixed(0)} MiB, ${player.rendererBackend})`
     case 'native-mse':
-      return `Playing (native MSE, ${player.rendererBackend})`
+      return player.playbackError
+        ? `Playing (native MSE, retrying buffer append, ${player.rendererBackend})`
+        : `Playing (native MSE, ${player.rendererBackend})`
   }
 }
 
@@ -305,6 +307,7 @@ interface LoopPlayer {
   readonly playbackState: PlaybackState
   readonly rendererBackend: RendererBackend
   readonly fullLoopMemory: { usedBytes: number; budgetBytes: number }
+  readonly playbackError?: string | null
   start(onPreparationProgress?: (progress: PreparationProgress) => void): Promise<void>
   stop(): void
   pauseForVisibility(): void
@@ -825,9 +828,12 @@ class NativeMseLoopPlayer implements LoopPlayer {
   private sourceBuffer: SourceBuffer | null = null
   private objectUrl: string | null = null
   private mediaSegment: ArrayBuffer | null = null
+  private loopDuration: number
   private nextLoopTimestamp = 0
   private appendInFlight = false
-  private appendChain: Promise<void> = Promise.resolve()
+  private appendQueued = false
+  private bufferMaintenanceTimerId = 0
+  private appendError: string | null = null
   private frameCallbackId = 0
   private lastRenderedLoopIndex = -1
   private readonly frameRateMonitor = new FrameRateMonitor()
@@ -836,7 +842,9 @@ class NativeMseLoopPlayer implements LoopPlayer {
     private readonly video: HTMLVideoElement,
     private readonly videoTrack: InputVideoTrack,
     private readonly duration: number,
-  ) {}
+  ) {
+    this.loopDuration = duration
+  }
 
   get playbackState(): PlaybackState {
     return this.playbackMode
@@ -846,6 +854,10 @@ class NativeMseLoopPlayer implements LoopPlayer {
     return { usedBytes: 0, budgetBytes: 0 }
   }
 
+  get playbackError(): string | null {
+    return this.appendError
+  }
+
   async start(onPreparationProgress?: (progress: PreparationProgress) => void): Promise<void> {
     this.playing = true
     this.visibilityPaused = false
@@ -853,6 +865,7 @@ class NativeMseLoopPlayer implements LoopPlayer {
     this.loopGapMs = null
     this.lastRenderedLoopIndex = -1
     this.frameRateMonitor.reset()
+    this.appendError = null
 
     const prepared = await this.prepareCmafSegment(onPreparationProgress)
     if (!this.playing) return
@@ -862,10 +875,12 @@ class NativeMseLoopPlayer implements LoopPlayer {
 
     await this.appendSegment(prepared.initSegment, 0)
     await this.appendSegment(prepared.mediaSegment, 0)
-    await this.appendSegment(prepared.mediaSegment, this.duration)
+    this.loopDuration = prepared.segmentDuration
+    await this.appendSegment(prepared.mediaSegment, this.loopDuration)
     this.mediaSegment = prepared.mediaSegment
-    this.nextLoopTimestamp = this.duration * 2
+    this.nextLoopTimestamp = this.loopDuration * 2
     this.playbackMode = 'native-mse'
+    this.startBufferMaintenance()
 
     if (!this.visibilityPaused) {
       await this.video.play()
@@ -877,6 +892,10 @@ class NativeMseLoopPlayer implements LoopPlayer {
     this.playing = false
     this.visibilityPaused = false
     this.cancelFrameCallback()
+    if (this.bufferMaintenanceTimerId !== 0) {
+      window.clearInterval(this.bufferMaintenanceTimerId)
+      this.bufferMaintenanceTimerId = 0
+    }
     this.video.pause()
     this.video.removeAttribute('src')
     this.video.load()
@@ -885,8 +904,9 @@ class NativeMseLoopPlayer implements LoopPlayer {
     this.objectUrl = null
     this.sourceBuffer = null
     this.mediaSegment = null
-    this.appendChain = Promise.resolve()
     this.appendInFlight = false
+    this.appendQueued = false
+    this.loopDuration = this.duration
     this.frameRateMonitor.reset()
   }
 
@@ -909,7 +929,12 @@ class NativeMseLoopPlayer implements LoopPlayer {
 
   private async prepareCmafSegment(
     onProgress?: (progress: PreparationProgress) => void,
-  ): Promise<{ initSegment: ArrayBuffer; mediaSegment: ArrayBuffer; mimeType: string }> {
+  ): Promise<{
+    initSegment: ArrayBuffer
+    mediaSegment: ArrayBuffer
+    mimeType: string
+    segmentDuration: number
+  }> {
     const codec = await this.videoTrack.getCodec()
     const decoderConfig = await this.videoTrack.getDecoderConfig()
     const codecString = decoderConfig?.codec ?? await this.videoTrack.getCodecParameterString()
@@ -932,6 +957,7 @@ class NativeMseLoopPlayer implements LoopPlayer {
     })
     const source = new EncodedVideoPacketSource(codec)
     output.addVideoTrack(source, { rotation: await this.videoTrack.getRotation() })
+    let segmentDuration = 0
 
     try {
       await output.start()
@@ -944,6 +970,10 @@ class NativeMseLoopPlayer implements LoopPlayer {
         const normalizedPacket = packet.clone({
           timestamp: packet.timestamp - firstTimestamp,
         })
+        segmentDuration = Math.max(
+          segmentDuration,
+          normalizedPacket.timestamp + normalizedPacket.duration,
+        )
         await source.add(
           normalizedPacket,
           firstPacket ? { decoderConfig: decoderConfig ?? undefined } : undefined,
@@ -972,6 +1002,7 @@ class NativeMseLoopPlayer implements LoopPlayer {
       initSegment: initTarget.buffer,
       mediaSegment: mediaTarget.buffer,
       mimeType,
+      segmentDuration: Math.max(0.001, segmentDuration),
     }
   }
 
@@ -1070,10 +1101,18 @@ class NativeMseLoopPlayer implements LoopPlayer {
     this.scheduleFrameCallback()
   }
 
+  private startBufferMaintenance(): void {
+    if (this.bufferMaintenanceTimerId !== 0) return
+    this.bufferMaintenanceTimerId = window.setInterval(() => {
+      this.maintainBuffer()
+    }, 100)
+    this.maintainBuffer()
+  }
+
   private inspectPresentedFrame(timestamp: number, mediaTime: number): void {
-    const loopIndex = Math.floor(mediaTime / this.duration)
+    const loopIndex = Math.floor(mediaTime / this.loopDuration)
     if (loopIndex > this.lastRenderedLoopIndex && this.lastRenderedLoopIndex >= 0) {
-      this.loopGapMs = (mediaTime - loopIndex * this.duration) * 1000
+      this.loopGapMs = (mediaTime - loopIndex * this.loopDuration) * 1000
     }
     this.lastRenderedLoopIndex = Math.max(this.lastRenderedLoopIndex, loopIndex)
     this.frameRateMonitor.record(timestamp, true, this.bufferAheadSeconds())
@@ -1091,24 +1130,62 @@ class NativeMseLoopPlayer implements LoopPlayer {
   }
 
   private maintainBuffer(): void {
-    if (!this.sourceBuffer || !this.mediaSegment || this.appendInFlight) return
+    if (
+      !this.playing
+      || this.visibilityPaused
+      || !this.sourceBuffer
+      || !this.mediaSegment
+    ) return
 
-    if (this.nextLoopTimestamp - this.video.currentTime < this.duration * 2) {
+    const currentTime = this.video.currentTime
+    const bufferedEnd = this.bufferedEndAt(currentTime)
+    const bufferAhead = bufferedEnd - currentTime
+    const targetAhead = this.loopDuration * 2
+
+    if (
+      (bufferAhead < targetAhead || !Number.isFinite(bufferAhead))
+      && !this.appendInFlight
+      && !this.appendQueued
+    ) {
       const timestampOffset = this.nextLoopTimestamp
-      this.nextLoopTimestamp += this.duration
-      this.appendChain = this.appendChain
-        .then(() => this.appendSegment(this.mediaSegment!, timestampOffset))
-        .catch(() => {})
+      this.nextLoopTimestamp += this.loopDuration
+      this.appendQueued = true
+      void this.appendSegment(this.mediaSegment, timestampOffset)
+        .then(() => {
+          this.appendError = null
+        })
+        .catch(error => {
+          this.nextLoopTimestamp = timestampOffset
+          this.appendError = error instanceof Error ? error.message : String(error)
+          console.warn('MSE loop segment append failed; retrying.', error)
+        })
+        .finally(() => {
+          this.appendQueued = false
+          if (this.playing) this.maintainBuffer()
+        })
     }
 
     if (
       !this.sourceBuffer.updating
-      && this.video.currentTime > this.duration * 3
+      && currentTime > this.loopDuration * 3
       && this.sourceBuffer.buffered.length > 0
-      && this.video.currentTime - this.sourceBuffer.buffered.start(0) > this.duration * 1.5
+      && currentTime - this.sourceBuffer.buffered.start(0) > this.loopDuration * 1.5
     ) {
-      this.sourceBuffer.remove(0, this.video.currentTime - this.duration)
+      this.sourceBuffer.remove(0, currentTime - this.loopDuration)
     }
+  }
+
+  private bufferedEndAt(currentTime: number): number {
+    if (!this.sourceBuffer || this.sourceBuffer.buffered.length === 0) return 0
+
+    let latestEnd = 0
+    for (let i = 0; i < this.sourceBuffer.buffered.length; i++) {
+      const start = this.sourceBuffer.buffered.start(i)
+      const end = this.sourceBuffer.buffered.end(i)
+      latestEnd = Math.max(latestEnd, end)
+      if (start <= currentTime && currentTime <= end) return end
+    }
+    return latestEnd
   }
 }
 
