@@ -54,9 +54,13 @@ document.querySelector('#app')!.innerHTML = `
         <div class="metric"><span>Frame FPS</span><strong id="renderFps">—</strong><small>video callback / rAF</small></div>
         <div class="metric"><span>Displayed FPS</span><strong id="displayedFps">—</strong><small>new video samples</small></div>
         <div class="metric"><span>Frame time</span><strong id="frameTime">—</strong><small>median render interval</small></div>
-        <div class="metric"><span>Long frames</span><strong id="longFrames">—</strong><small>rAF gap &gt; 1.5× median</small></div>
+        <div class="metric"><span>Long intervals</span><strong id="longFrames">—</strong><small>callback gap &gt; 1.5× median</small></div>
+        <div class="metric"><span>Missed video frames</span><strong id="missedFrames">—</strong><small>presentedFrames gaps</small></div>
+        <div class="metric"><span>V-sync offset</span><strong id="vSyncOffset">—</strong><small>expected display − callback</small></div>
+        <div class="metric"><span>Decoder time</span><strong id="decoderTime">—</strong><small>median processingDuration</small></div>
         <div class="metric"><span>Decode-ahead</span><strong id="bufferAhead">—</strong><small>seconds queued</small></div>
         <div class="metric"><span>Full-loop memory</span><strong id="fullLoopMemory">—</strong><small>decoded sample allocation</small></div>
+        <div class="metric"><span>Source cadence</span><strong id="sourceCadence">—</strong><small>encoded packet timing</small></div>
       </div>
     </section>
   </main>
@@ -78,8 +82,12 @@ const renderFpsEl = document.querySelector<HTMLElement>('#renderFps')!
 const displayedFpsEl = document.querySelector<HTMLElement>('#displayedFps')!
 const frameTimeEl = document.querySelector<HTMLElement>('#frameTime')!
 const longFramesEl = document.querySelector<HTMLElement>('#longFrames')!
+const missedFramesEl = document.querySelector<HTMLElement>('#missedFrames')!
+const vSyncOffsetEl = document.querySelector<HTMLElement>('#vSyncOffset')!
+const decoderTimeEl = document.querySelector<HTMLElement>('#decoderTime')!
 const bufferAheadEl = document.querySelector<HTMLElement>('#bufferAhead')!
 const fullLoopMemoryEl = document.querySelector<HTMLElement>('#fullLoopMemory')!
+const sourceCadenceEl = document.querySelector<HTMLElement>('#sourceCadence')!
 
 // ──────────────────────────────────────────────
 // Utilities
@@ -151,10 +159,20 @@ type FrameRateSnapshot = {
   displayedFps: number | null
   medianFrameTimeMs: number | null
   longFrames: number | null
+  missedVideoFrames: number | null
+  vSyncOffsetMs: number | null
+  medianDecoderTimeMs: number | null
   bufferAheadSec: number | null
 }
 
-/** Low-overhead rolling diagnostics for the canvas render loop. */
+type SourceTiming = {
+  frameRate: number
+  frameDurationMs: number
+  jitterMs: number
+  constantFrameRate: boolean
+}
+
+/** Low-overhead rolling diagnostics for canvas and native-video presentation. */
 class FrameRateMonitor {
   private readonly windowMs = 2000
   private renderTimestamps: number[] = []
@@ -162,6 +180,10 @@ class FrameRateMonitor {
   private frameIntervals: Array<{ timestamp: number; interval: number }> = []
   private lastRenderTimestamp: number | null = null
   private bufferAheadSec: number | null = null
+  private missedVideoFrameEvents: Array<{ timestamp: number; count: number }> = []
+  private vSyncOffsets: Array<{ timestamp: number; offsetMs: number }> = []
+  private decoderTimeSamples: Array<{ timestamp: number; durationMs: number }> = []
+  private lastPresentedFrames: number | null = null
 
   reset(): void {
     this.renderTimestamps = []
@@ -169,6 +191,10 @@ class FrameRateMonitor {
     this.frameIntervals = []
     this.lastRenderTimestamp = null
     this.bufferAheadSec = null
+    this.missedVideoFrameEvents = []
+    this.vSyncOffsets = []
+    this.decoderTimeSamples = []
+    this.lastPresentedFrames = null
   }
 
   record(timestamp: number, displayedNewFrame: boolean, bufferAheadSec: number): void {
@@ -192,6 +218,36 @@ class FrameRateMonitor {
     }
   }
 
+  recordVideo(
+    timestamp: number,
+    metadata: VideoFrameCallbackMetadata,
+    bufferAheadSec: number,
+  ): void {
+    this.record(timestamp, true, bufferAheadSec)
+
+    if (this.lastPresentedFrames !== null) {
+      const missed = Math.max(0, metadata.presentedFrames - this.lastPresentedFrames - 1)
+      if (missed > 0) this.missedVideoFrameEvents.push({ timestamp, count: missed })
+    }
+    this.lastPresentedFrames = metadata.presentedFrames
+
+    if (Number.isFinite(metadata.expectedDisplayTime)) {
+      this.vSyncOffsets.push({
+        timestamp,
+        offsetMs: metadata.expectedDisplayTime - timestamp,
+      })
+    }
+    const processingDuration = metadata.processingDuration
+    if (processingDuration !== undefined && Number.isFinite(processingDuration)) {
+      this.decoderTimeSamples.push({
+        timestamp,
+        durationMs: processingDuration * 1000,
+      })
+    }
+
+    this.pruneVideoTiming(timestamp)
+  }
+
   snapshot(): FrameRateSnapshot {
     const renderFps = this.rate(this.renderTimestamps)
     const displayedFps = this.rate(this.displayedTimestamps)
@@ -206,8 +262,31 @@ class FrameRateMonitor {
       displayedFps,
       medianFrameTimeMs,
       longFrames,
+      missedVideoFrames: this.sumRecentMissedFrames(),
+      vSyncOffsetMs: this.vSyncOffsets.length > 0
+        ? this.median(this.vSyncOffsets.map(sample => sample.offsetMs))
+        : null,
+      medianDecoderTimeMs: this.median(this.decoderTimeSamples.map(sample => sample.durationMs)),
       bufferAheadSec: this.bufferAheadSec,
     }
+  }
+
+  private pruneVideoTiming(timestamp: number): void {
+    const cutoff = timestamp - this.windowMs
+    while (this.missedVideoFrameEvents.length > 0 && this.missedVideoFrameEvents[0].timestamp < cutoff) {
+      this.missedVideoFrameEvents.shift()
+    }
+    while (this.vSyncOffsets.length > 0 && this.vSyncOffsets[0].timestamp < cutoff) {
+      this.vSyncOffsets.shift()
+    }
+    while (this.decoderTimeSamples.length > 0 && this.decoderTimeSamples[0].timestamp < cutoff) {
+      this.decoderTimeSamples.shift()
+    }
+  }
+
+  private sumRecentMissedFrames(): number | null {
+    if (this.lastPresentedFrames === null) return null
+    return this.missedVideoFrameEvents.reduce((sum, event) => sum + event.count, 0)
   }
 
   private rate(timestamps: number[]): number | null {
@@ -308,6 +387,7 @@ interface LoopPlayer {
   readonly rendererBackend: RendererBackend
   readonly fullLoopMemory: { usedBytes: number; budgetBytes: number }
   readonly playbackError?: string | null
+  readonly sourceTiming?: SourceTiming | null
   start(onPreparationProgress?: (progress: PreparationProgress) => void): Promise<void>
   stop(): void
   pauseForVisibility(): void
@@ -819,6 +899,13 @@ class WebGPURenderer implements FrameRenderer {
  * timestamp-offset copies to a continuous native <video> timeline.
  */
 class NativeMseLoopPlayer implements LoopPlayer {
+  // SourceBuffer removal can be observable on mobile compositors. Keep a
+  // larger history and remove it in larger batches instead of trimming every
+  // half-loop. This reduces the number of removal operations while keeping
+  // the rolling buffer bounded.
+  private static readonly RETAINED_HISTORY_LOOPS = 3
+  private static readonly TRIM_TRIGGER_LOOPS = 6
+
   readonly rendererBackend: RendererBackend = 'MSE'
   loopGapMs: number | null = null
 
@@ -829,11 +916,13 @@ class NativeMseLoopPlayer implements LoopPlayer {
   private objectUrl: string | null = null
   private mediaSegment: ArrayBuffer | null = null
   private loopDuration: number
+  private sourceTimingSnapshot: SourceTiming | null = null
   private nextLoopTimestamp = 0
   private appendInFlight = false
   private appendQueued = false
   private bufferMaintenanceTimerId = 0
   private appendError: string | null = null
+  private lastBufferAheadSec = 0
   private frameCallbackId = 0
   private lastRenderedLoopIndex = -1
   private readonly frameRateMonitor = new FrameRateMonitor()
@@ -858,6 +947,10 @@ class NativeMseLoopPlayer implements LoopPlayer {
     return this.appendError
   }
 
+  get sourceTiming(): SourceTiming | null {
+    return this.sourceTimingSnapshot
+  }
+
   async start(onPreparationProgress?: (progress: PreparationProgress) => void): Promise<void> {
     this.playing = true
     this.visibilityPaused = false
@@ -866,6 +959,8 @@ class NativeMseLoopPlayer implements LoopPlayer {
     this.lastRenderedLoopIndex = -1
     this.frameRateMonitor.reset()
     this.appendError = null
+    this.sourceTimingSnapshot = null
+    this.lastBufferAheadSec = 0
 
     const prepared = await this.prepareCmafSegment(onPreparationProgress)
     if (!this.playing) return
@@ -875,6 +970,7 @@ class NativeMseLoopPlayer implements LoopPlayer {
 
     await this.appendSegment(prepared.initSegment, 0)
     await this.appendSegment(prepared.mediaSegment, 0)
+    this.sourceTimingSnapshot = prepared.sourceTiming
     this.loopDuration = prepared.segmentDuration
     await this.appendSegment(prepared.mediaSegment, this.loopDuration)
     this.mediaSegment = prepared.mediaSegment
@@ -907,6 +1003,8 @@ class NativeMseLoopPlayer implements LoopPlayer {
     this.appendInFlight = false
     this.appendQueued = false
     this.loopDuration = this.duration
+    this.sourceTimingSnapshot = null
+    this.lastBufferAheadSec = 0
     this.frameRateMonitor.reset()
   }
 
@@ -934,6 +1032,7 @@ class NativeMseLoopPlayer implements LoopPlayer {
     mediaSegment: ArrayBuffer
     mimeType: string
     segmentDuration: number
+    sourceTiming: SourceTiming | null
   }> {
     const codec = await this.videoTrack.getCodec()
     const decoderConfig = await this.videoTrack.getDecoderConfig()
@@ -958,6 +1057,10 @@ class NativeMseLoopPlayer implements LoopPlayer {
     const source = new EncodedVideoPacketSource(codec)
     output.addVideoTrack(source, { rotation: await this.videoTrack.getRotation() })
     let segmentDuration = 0
+    let durationSum = 0
+    let durationCount = 0
+    let durationMin = Number.POSITIVE_INFINITY
+    let durationMax = 0
 
     try {
       await output.start()
@@ -974,6 +1077,12 @@ class NativeMseLoopPlayer implements LoopPlayer {
           segmentDuration,
           normalizedPacket.timestamp + normalizedPacket.duration,
         )
+        if (normalizedPacket.duration > 0 && Number.isFinite(normalizedPacket.duration)) {
+          durationSum += normalizedPacket.duration
+          durationCount += 1
+          durationMin = Math.min(durationMin, normalizedPacket.duration)
+          durationMax = Math.max(durationMax, normalizedPacket.duration)
+        }
         await source.add(
           normalizedPacket,
           firstPacket ? { decoderConfig: decoderConfig ?? undefined } : undefined,
@@ -1003,6 +1112,18 @@ class NativeMseLoopPlayer implements LoopPlayer {
       mediaSegment: mediaTarget.buffer,
       mimeType,
       segmentDuration: Math.max(0.001, segmentDuration),
+      sourceTiming: durationCount > 0
+        ? (() => {
+          const averageDuration = durationSum / durationCount
+          const jitter = durationMax - durationMin
+          return {
+            frameRate: 1 / averageDuration,
+            frameDurationMs: averageDuration * 1000,
+            jitterMs: jitter * 1000,
+            constantFrameRate: jitter <= Math.max(0.0005, averageDuration * 0.01),
+          }
+        })()
+        : null,
     }
   }
 
@@ -1089,15 +1210,15 @@ class NativeMseLoopPlayer implements LoopPlayer {
 
   private onVideoFrame = (now: number, metadata: VideoFrameCallbackMetadata): void => {
     if (!this.playing || this.visibilityPaused) return
-    this.inspectPresentedFrame(now, metadata.mediaTime)
-    this.maintainBuffer()
+    this.inspectPresentedFrame(metadata.mediaTime)
+    this.frameRateMonitor.recordVideo(now, metadata, this.lastBufferAheadSec)
     this.scheduleFrameCallback()
   }
 
   private onFallbackFrame = (now: number): void => {
     if (!this.playing || this.visibilityPaused) return
-    this.inspectPresentedFrame(now, this.video.currentTime)
-    this.maintainBuffer()
+    this.inspectPresentedFrame(this.video.currentTime)
+    this.frameRateMonitor.record(now, true, this.lastBufferAheadSec)
     this.scheduleFrameCallback()
   }
 
@@ -1109,24 +1230,12 @@ class NativeMseLoopPlayer implements LoopPlayer {
     this.maintainBuffer()
   }
 
-  private inspectPresentedFrame(timestamp: number, mediaTime: number): void {
+  private inspectPresentedFrame(mediaTime: number): void {
     const loopIndex = Math.floor(mediaTime / this.loopDuration)
     if (loopIndex > this.lastRenderedLoopIndex && this.lastRenderedLoopIndex >= 0) {
       this.loopGapMs = (mediaTime - loopIndex * this.loopDuration) * 1000
     }
     this.lastRenderedLoopIndex = Math.max(this.lastRenderedLoopIndex, loopIndex)
-    this.frameRateMonitor.record(timestamp, true, this.bufferAheadSeconds())
-  }
-
-  private bufferAheadSeconds(): number {
-    const currentTime = this.video.currentTime
-    const buffered = this.video.buffered
-    for (let i = 0; i < buffered.length; i++) {
-      if (buffered.start(i) <= currentTime && currentTime <= buffered.end(i)) {
-        return Math.max(0, buffered.end(i) - currentTime)
-      }
-    }
-    return 0
   }
 
   private maintainBuffer(): void {
@@ -1140,6 +1249,7 @@ class NativeMseLoopPlayer implements LoopPlayer {
     const currentTime = this.video.currentTime
     const bufferedEnd = this.bufferedEndAt(currentTime)
     const bufferAhead = bufferedEnd - currentTime
+    this.lastBufferAheadSec = Math.max(0, bufferAhead)
     const targetAhead = this.loopDuration * 2
 
     if (
@@ -1167,11 +1277,17 @@ class NativeMseLoopPlayer implements LoopPlayer {
 
     if (
       !this.sourceBuffer.updating
-      && currentTime > this.loopDuration * 3
+      && !this.appendInFlight
+      && !this.appendQueued
+      && currentTime > this.loopDuration * NativeMseLoopPlayer.TRIM_TRIGGER_LOOPS
       && this.sourceBuffer.buffered.length > 0
-      && currentTime - this.sourceBuffer.buffered.start(0) > this.loopDuration * 1.5
+      && currentTime - this.sourceBuffer.buffered.start(0)
+        > this.loopDuration * NativeMseLoopPlayer.TRIM_TRIGGER_LOOPS
     ) {
-      this.sourceBuffer.remove(0, currentTime - this.loopDuration)
+      this.sourceBuffer.remove(
+        0,
+        currentTime - this.loopDuration * NativeMseLoopPlayer.RETAINED_HISTORY_LOOPS,
+      )
     }
   }
 
@@ -1656,6 +1772,15 @@ function updateFrameRateMonitor(player: LoopPlayer): void {
   longFramesEl.textContent = snapshot.longFrames === null
     ? '—'
     : String(snapshot.longFrames)
+  missedFramesEl.textContent = snapshot.missedVideoFrames === null
+    ? '—'
+    : String(snapshot.missedVideoFrames)
+  vSyncOffsetEl.textContent = snapshot.vSyncOffsetMs === null
+    ? '—'
+    : `${snapshot.vSyncOffsetMs.toFixed(1)} ms`
+  decoderTimeEl.textContent = snapshot.medianDecoderTimeMs === null
+    ? '—'
+    : `${snapshot.medianDecoderTimeMs.toFixed(1)} ms`
   bufferAheadEl.textContent = snapshot.bufferAheadSec === null
     ? '—'
     : `${snapshot.bufferAheadSec.toFixed(2)} s`
@@ -1663,6 +1788,10 @@ function updateFrameRateMonitor(player: LoopPlayer): void {
   fullLoopMemoryEl.textContent = player.playbackState === 'full-loop'
     ? `${(memory.usedBytes / MIB).toFixed(0)} / ${(memory.budgetBytes / MIB).toFixed(0)} MiB`
     : player.playbackState
+  const sourceTiming = player.sourceTiming
+  sourceCadenceEl.textContent = sourceTiming
+    ? `${sourceTiming.frameRate.toFixed(2)} fps ${sourceTiming.constantFrameRate ? 'CFR' : 'VFR'}`
+    : '—'
 
   if (currentPlayer === player) setStatus(playbackStatus(player))
 }
@@ -1672,8 +1801,12 @@ function resetFrameRateMonitor(): void {
   displayedFpsEl.textContent = '—'
   frameTimeEl.textContent = '—'
   longFramesEl.textContent = '—'
+  missedFramesEl.textContent = '—'
+  vSyncOffsetEl.textContent = '—'
+  decoderTimeEl.textContent = '—'
   bufferAheadEl.textContent = '—'
   fullLoopMemoryEl.textContent = '—'
+  sourceCadenceEl.textContent = '—'
 }
 
 function teardown(): void {
