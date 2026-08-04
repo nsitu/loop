@@ -905,6 +905,7 @@ class NativeMseLoopPlayer implements LoopPlayer {
   // the rolling buffer bounded.
   private static readonly RETAINED_HISTORY_LOOPS = 3
   private static readonly TRIM_TRIGGER_LOOPS = 6
+  private static readonly APPEND_LEAD_SECONDS = 2
 
   readonly rendererBackend: RendererBackend = 'MSE'
   loopGapMs: number | null = null
@@ -1250,7 +1251,14 @@ class NativeMseLoopPlayer implements LoopPlayer {
     const bufferedEnd = this.bufferedEndAt(currentTime)
     const bufferAhead = bufferedEnd - currentTime
     this.lastBufferAheadSec = Math.max(0, bufferAhead)
-    const targetAhead = this.loopDuration * 2
+    // Append the next loop before the boundary. This keeps the relatively
+    // expensive MSE append away from the moment the compositor switches to
+    // the repeated segment.
+    const appendLead = Math.min(
+      NativeMseLoopPlayer.APPEND_LEAD_SECONDS,
+      this.loopDuration * 0.5,
+    )
+    const targetAhead = this.loopDuration * 2 + appendLead
 
     if (
       (bufferAhead < targetAhead || !Number.isFinite(bufferAhead))
