@@ -1,5 +1,15 @@
 import './style.css'
-import { Input, BlobSource, ALL_FORMATS, VideoSampleSink } from 'mediabunny'
+import {
+  ALL_FORMATS,
+  BlobSource,
+  BufferTarget,
+  CmafOutputFormat,
+  EncodedPacketSink,
+  EncodedVideoPacketSource,
+  Input,
+  Output,
+  VideoSampleSink,
+} from 'mediabunny'
 import type { InputVideoTrack, VideoSample } from 'mediabunny'
 
 // ──────────────────────────────────────────────
@@ -22,6 +32,7 @@ document.querySelector('#app')!.innerHTML = `
 
     <div id="playerContainer">
       <canvas id="player"></canvas>
+      <video id="playerVideo" muted playsinline disablepictureinpicture></video>
     </div>
 
     <section class="status" aria-live="polite">
@@ -40,7 +51,7 @@ document.querySelector('#app')!.innerHTML = `
         <span>updates every 500 ms</span>
       </div>
       <div class="metric-grid">
-        <div class="metric"><span>Render FPS</span><strong id="renderFps">—</strong><small>requestAnimationFrame</small></div>
+        <div class="metric"><span>Frame FPS</span><strong id="renderFps">—</strong><small>video callback / rAF</small></div>
         <div class="metric"><span>Displayed FPS</span><strong id="displayedFps">—</strong><small>new video samples</small></div>
         <div class="metric"><span>Frame time</span><strong id="frameTime">—</strong><small>median render interval</small></div>
         <div class="metric"><span>Long frames</span><strong id="longFrames">—</strong><small>rAF gap &gt; 1.5× median</small></div>
@@ -56,6 +67,7 @@ const pickerButton = document.querySelector<HTMLButtonElement>('#pickerButton')!
 const fullscreenButton = document.querySelector<HTMLButtonElement>('#fullscreenButton')!
 const playerContainer = document.querySelector<HTMLDivElement>('#playerContainer')!
 const canvas = document.querySelector<HTMLCanvasElement>('#player')!
+const playerVideo = document.querySelector<HTMLVideoElement>('#playerVideo')!
 const fileNameEl = document.querySelector<HTMLElement>('#fileName')!
 const loopGapEl = document.querySelector<HTMLElement>('#loopGap')!
 const statusEl = document.querySelector<HTMLElement>('#statusText')!
@@ -77,7 +89,7 @@ function setStatus(msg: string) {
   statusEl.textContent = msg
 }
 
-function playbackStatus(player: SeamlessLoopPlayer): string {
+function playbackStatus(player: LoopPlayer): string {
   switch (player.playbackState) {
     case 'preparing':
       return `Preparing playback (${player.rendererBackend})`
@@ -85,6 +97,8 @@ function playbackStatus(player: SeamlessLoopPlayer): string {
       return `Playing (streaming decode, ${player.rendererBackend})`
     case 'full-loop':
       return `Playing (full loop buffered, ${(player.fullLoopMemory.usedBytes / MIB).toFixed(0)} MiB, ${player.rendererBackend})`
+    case 'native-mse':
+      return `Playing (native MSE, ${player.rendererBackend})`
   }
 }
 
@@ -95,14 +109,12 @@ function resetPreloadProgress(): void {
 }
 
 function updatePreloadProgress(
-  player: SeamlessLoopPlayer,
-  progress: PreloadProgress,
+  player: LoopPlayer,
+  progress: PreparationProgress,
 ): void {
   preloadStatusEl.hidden = false
   preloadProgressEl.value = progress.fraction
-  preloadProgressLabelEl.textContent = `${(progress.fraction * 100).toFixed(0)}% · `
-    + `${progress.decodedSeconds.toFixed(1)} / ${progress.duration.toFixed(1)} s · `
-    + `${(progress.usedBytes / MIB).toFixed(0)} / ${(progress.budgetBytes / MIB).toFixed(0)} MiB`
+  preloadProgressLabelEl.textContent = `${(progress.fraction * 100).toFixed(0)}% · ${progress.detail}`
   setStatus(playbackStatus(player))
 }
 
@@ -280,7 +292,25 @@ async function releaseWakeLock(): Promise<void> {
 // WebGL renderer
 // ──────────────────────────────────────────────
 
-type RendererBackend = 'WebGL2' | 'WebGL1' | 'WebGPU'
+type RendererBackend = 'MSE' | 'WebGL2' | 'WebGL1' | 'WebGPU'
+type PlaybackState = 'preparing' | 'streaming' | 'full-loop' | 'native-mse'
+
+type PreparationProgress = {
+  fraction: number
+  detail: string
+}
+
+interface LoopPlayer {
+  readonly loopGapMs: number | null
+  readonly playbackState: PlaybackState
+  readonly rendererBackend: RendererBackend
+  readonly fullLoopMemory: { usedBytes: number; budgetBytes: number }
+  start(onPreparationProgress?: (progress: PreparationProgress) => void): Promise<void>
+  stop(): void
+  pauseForVisibility(): void
+  resumeFromVisibility(): void
+  getFrameRateSnapshot(): FrameRateSnapshot
+}
 
 interface FrameRenderer {
   readonly backend: RendererBackend
@@ -780,6 +810,308 @@ class WebGPURenderer implements FrameRenderer {
   }
 }
 
+/**
+ * Native playback path. Mediabunny copies the encoded video packets into one
+ * CMAF/fMP4 init segment and one media segment; MSE then appends repeated
+ * timestamp-offset copies to a continuous native <video> timeline.
+ */
+class NativeMseLoopPlayer implements LoopPlayer {
+  readonly rendererBackend: RendererBackend = 'MSE'
+  loopGapMs: number | null = null
+
+  private playbackMode: PlaybackState = 'preparing'
+  private playing = false
+  private visibilityPaused = false
+  private sourceBuffer: SourceBuffer | null = null
+  private objectUrl: string | null = null
+  private mediaSegment: ArrayBuffer | null = null
+  private nextLoopTimestamp = 0
+  private appendInFlight = false
+  private appendChain: Promise<void> = Promise.resolve()
+  private frameCallbackId = 0
+  private lastRenderedLoopIndex = -1
+  private readonly frameRateMonitor = new FrameRateMonitor()
+
+  constructor(
+    private readonly video: HTMLVideoElement,
+    private readonly videoTrack: InputVideoTrack,
+    private readonly duration: number,
+  ) {}
+
+  get playbackState(): PlaybackState {
+    return this.playbackMode
+  }
+
+  get fullLoopMemory(): { usedBytes: number; budgetBytes: number } {
+    return { usedBytes: 0, budgetBytes: 0 }
+  }
+
+  async start(onPreparationProgress?: (progress: PreparationProgress) => void): Promise<void> {
+    this.playing = true
+    this.visibilityPaused = false
+    this.playbackMode = 'preparing'
+    this.loopGapMs = null
+    this.lastRenderedLoopIndex = -1
+    this.frameRateMonitor.reset()
+
+    const prepared = await this.prepareCmafSegment(onPreparationProgress)
+    if (!this.playing) return
+
+    await this.attachMediaSource(prepared.initSegment, prepared.mediaSegment, prepared.mimeType)
+    if (!this.playing) return
+
+    await this.appendSegment(prepared.initSegment, 0)
+    await this.appendSegment(prepared.mediaSegment, 0)
+    await this.appendSegment(prepared.mediaSegment, this.duration)
+    this.mediaSegment = prepared.mediaSegment
+    this.nextLoopTimestamp = this.duration * 2
+    this.playbackMode = 'native-mse'
+
+    if (!this.visibilityPaused) {
+      await this.video.play()
+      this.scheduleFrameCallback()
+    }
+  }
+
+  stop(): void {
+    this.playing = false
+    this.visibilityPaused = false
+    this.cancelFrameCallback()
+    this.video.pause()
+    this.video.removeAttribute('src')
+    this.video.load()
+
+    if (this.objectUrl) URL.revokeObjectURL(this.objectUrl)
+    this.objectUrl = null
+    this.sourceBuffer = null
+    this.mediaSegment = null
+    this.appendChain = Promise.resolve()
+    this.appendInFlight = false
+    this.frameRateMonitor.reset()
+  }
+
+  pauseForVisibility(): void {
+    if (!this.playing || this.visibilityPaused) return
+    this.visibilityPaused = true
+    this.cancelFrameCallback()
+    this.video.pause()
+  }
+
+  resumeFromVisibility(): void {
+    if (!this.playing || !this.visibilityPaused) return
+    this.visibilityPaused = false
+    void this.video.play().then(() => this.scheduleFrameCallback()).catch(() => {})
+  }
+
+  getFrameRateSnapshot(): FrameRateSnapshot {
+    return this.frameRateMonitor.snapshot()
+  }
+
+  private async prepareCmafSegment(
+    onProgress?: (progress: PreparationProgress) => void,
+  ): Promise<{ initSegment: ArrayBuffer; mediaSegment: ArrayBuffer; mimeType: string }> {
+    const codec = await this.videoTrack.getCodec()
+    const decoderConfig = await this.videoTrack.getDecoderConfig()
+    const codecString = decoderConfig?.codec ?? await this.videoTrack.getCodecParameterString()
+    const firstTimestamp = await this.videoTrack.getFirstTimestamp()
+    if (!codec || !codecString) throw new Error('Could not determine the video codec for MSE.')
+
+    const mimeType = `video/mp4; codecs="${codecString}"`
+    if (!('MediaSource' in window) || !MediaSource.isTypeSupported(mimeType)) {
+      throw new Error(`MSE does not support ${mimeType}.`)
+    }
+
+    onProgress?.({ fraction: 0, detail: 'Preparing fragmented MP4…' })
+
+    const initTarget = new BufferTarget()
+    const mediaTarget = new BufferTarget()
+    const output = new Output({
+      format: new CmafOutputFormat(),
+      target: mediaTarget,
+      initTarget,
+    })
+    const source = new EncodedVideoPacketSource(codec)
+    output.addVideoTrack(source, { rotation: await this.videoTrack.getRotation() })
+
+    try {
+      await output.start()
+      const sink = new EncodedPacketSink(this.videoTrack)
+      let firstPacket = true
+
+      for await (const packet of sink.packets(undefined, undefined, { verifyKeyPackets: true })) {
+        if (!this.playing) throw new Error('MSE preparation canceled.')
+
+        const normalizedPacket = packet.clone({
+          timestamp: packet.timestamp - firstTimestamp,
+        })
+        await source.add(
+          normalizedPacket,
+          firstPacket ? { decoderConfig: decoderConfig ?? undefined } : undefined,
+        )
+        firstPacket = false
+        onProgress?.({
+          fraction: Math.min(1, Math.max(0, (normalizedPacket.timestamp + normalizedPacket.duration) / this.duration)),
+          detail: `${Math.min(this.duration, normalizedPacket.timestamp + normalizedPacket.duration).toFixed(1)} / `
+            + `${this.duration.toFixed(1)} s · packaging encoded packets`,
+        })
+      }
+
+      source.close()
+      await output.finalize()
+    } catch (error) {
+      source.close()
+      await output.cancel().catch(() => {})
+      throw error
+    }
+
+    if (!initTarget.buffer || !mediaTarget.buffer) {
+      throw new Error('MSE segment preparation produced no data.')
+    }
+
+    return {
+      initSegment: initTarget.buffer,
+      mediaSegment: mediaTarget.buffer,
+      mimeType,
+    }
+  }
+
+  private async attachMediaSource(
+    initSegment: ArrayBuffer,
+    mediaSegment: ArrayBuffer,
+    mimeType: string,
+  ): Promise<void> {
+    const mediaSource = new MediaSource()
+    this.mediaSegment = mediaSegment
+    this.objectUrl = URL.createObjectURL(mediaSource)
+    this.video.src = this.objectUrl
+
+    await new Promise<void>((resolve, reject) => {
+      const onOpen = () => {
+        mediaSource.removeEventListener('sourceopen', onOpen)
+        try {
+          this.sourceBuffer = mediaSource.addSourceBuffer(mimeType)
+          this.sourceBuffer.mode = 'segments'
+          resolve()
+        } catch (error) {
+          reject(error)
+        }
+      }
+      mediaSource.addEventListener('sourceopen', onOpen, { once: true })
+      mediaSource.addEventListener('error', () => reject(new Error('MediaSource failed to open.')), { once: true })
+    })
+
+    // Keep the arguments alive in this method so the initial append sequence
+    // remains explicit and easy to inspect during device testing.
+    void initSegment
+  }
+
+  private appendSegment(segment: ArrayBuffer, timestampOffset: number): Promise<void> {
+    const sourceBuffer = this.sourceBuffer
+    if (!sourceBuffer) return Promise.reject(new Error('MSE SourceBuffer is unavailable.'))
+
+    return new Promise((resolve, reject) => {
+      const onUpdateEnd = () => {
+        cleanup()
+        resolve()
+      }
+      const onError = () => {
+        cleanup()
+        reject(new Error('MSE SourceBuffer append failed.'))
+      }
+      const cleanup = () => {
+        sourceBuffer.removeEventListener('updateend', onUpdateEnd)
+        sourceBuffer.removeEventListener('error', onError)
+        this.appendInFlight = false
+      }
+
+      this.appendInFlight = true
+      sourceBuffer.addEventListener('updateend', onUpdateEnd, { once: true })
+      sourceBuffer.addEventListener('error', onError, { once: true })
+      try {
+        sourceBuffer.timestampOffset = timestampOffset
+        sourceBuffer.appendBuffer(segment.slice(0))
+      } catch (error) {
+        cleanup()
+        reject(error)
+      }
+    })
+  }
+
+  private scheduleFrameCallback(): void {
+    if (!this.playing || this.visibilityPaused) return
+    if ('requestVideoFrameCallback' in this.video) {
+      this.frameCallbackId = this.video.requestVideoFrameCallback(this.onVideoFrame)
+    } else {
+      this.frameCallbackId = requestAnimationFrame(this.onFallbackFrame)
+    }
+  }
+
+  private cancelFrameCallback(): void {
+    if (this.frameCallbackId === 0) return
+    if ('cancelVideoFrameCallback' in this.video) {
+      this.video.cancelVideoFrameCallback(this.frameCallbackId)
+    } else {
+      cancelAnimationFrame(this.frameCallbackId)
+    }
+    this.frameCallbackId = 0
+  }
+
+  private onVideoFrame = (now: number, metadata: VideoFrameCallbackMetadata): void => {
+    if (!this.playing || this.visibilityPaused) return
+    this.inspectPresentedFrame(now, metadata.mediaTime)
+    this.maintainBuffer()
+    this.scheduleFrameCallback()
+  }
+
+  private onFallbackFrame = (now: number): void => {
+    if (!this.playing || this.visibilityPaused) return
+    this.inspectPresentedFrame(now, this.video.currentTime)
+    this.maintainBuffer()
+    this.scheduleFrameCallback()
+  }
+
+  private inspectPresentedFrame(timestamp: number, mediaTime: number): void {
+    const loopIndex = Math.floor(mediaTime / this.duration)
+    if (loopIndex > this.lastRenderedLoopIndex && this.lastRenderedLoopIndex >= 0) {
+      this.loopGapMs = (mediaTime - loopIndex * this.duration) * 1000
+    }
+    this.lastRenderedLoopIndex = Math.max(this.lastRenderedLoopIndex, loopIndex)
+    this.frameRateMonitor.record(timestamp, true, this.bufferAheadSeconds())
+  }
+
+  private bufferAheadSeconds(): number {
+    const currentTime = this.video.currentTime
+    const buffered = this.video.buffered
+    for (let i = 0; i < buffered.length; i++) {
+      if (buffered.start(i) <= currentTime && currentTime <= buffered.end(i)) {
+        return Math.max(0, buffered.end(i) - currentTime)
+      }
+    }
+    return 0
+  }
+
+  private maintainBuffer(): void {
+    if (!this.sourceBuffer || !this.mediaSegment || this.appendInFlight) return
+
+    if (this.nextLoopTimestamp - this.video.currentTime < this.duration * 2) {
+      const timestampOffset = this.nextLoopTimestamp
+      this.nextLoopTimestamp += this.duration
+      this.appendChain = this.appendChain
+        .then(() => this.appendSegment(this.mediaSegment!, timestampOffset))
+        .catch(() => {})
+    }
+
+    if (
+      !this.sourceBuffer.updating
+      && this.video.currentTime > this.duration * 3
+      && this.sourceBuffer.buffered.length > 0
+      && this.video.currentTime - this.sourceBuffer.buffered.start(0) > this.duration * 1.5
+    ) {
+      this.sourceBuffer.remove(0, this.video.currentTime - this.duration)
+    }
+  }
+}
+
 // SeamlessLoopPlayer
 // ──────────────────────────────────────────────
 //
@@ -824,14 +1156,6 @@ const TARGET_DEVICE = {
   fullLoopMemoryBudgetBytes: 512 * MIB,
 }
 
-type PreloadProgress = {
-  fraction: number
-  decodedSeconds: number
-  duration: number
-  usedBytes: number
-  budgetBytes: number
-}
-
 class SeamlessLoopPlayer {
   private readonly videoTrack: InputVideoTrack
   private readonly duration: number
@@ -848,7 +1172,7 @@ class SeamlessLoopPlayer {
 
   private playing = false
   private visibilityPaused = false
-  private playbackMode: 'preparing' | 'streaming' | 'full-loop' = 'preparing'
+  private playbackMode: PlaybackState = 'preparing'
   private producerGeneration = 0
   /** performance.now() timestamp when playback started. */
   private startTime = 0
@@ -874,7 +1198,7 @@ class SeamlessLoopPlayer {
     this.renderer = renderer
   }
 
-  async start(onPreloadProgress?: (progress: PreloadProgress) => void): Promise<void> {
+  async start(onPreloadProgress?: (progress: PreparationProgress) => void): Promise<void> {
     this.playing = true
     this.visibilityPaused = false
     this.playbackMode = 'preparing'
@@ -941,7 +1265,7 @@ class SeamlessLoopPlayer {
     return this.fullLoopSamples !== null
   }
 
-  get playbackState(): 'preparing' | 'streaming' | 'full-loop' {
+  get playbackState(): PlaybackState {
     return this.playbackMode
   }
 
@@ -966,7 +1290,7 @@ class SeamlessLoopPlayer {
 
   private async preparePlayback(
     generation: number,
-    onPreloadProgress?: (progress: PreloadProgress) => void,
+    onPreloadProgress?: (progress: PreparationProgress) => void,
   ): Promise<void> {
     const buffered = await this.tryPredecodeLoop(generation, onPreloadProgress)
     if (!this.playing || generation !== this.producerGeneration) return
@@ -1146,7 +1470,7 @@ class SeamlessLoopPlayer {
    */
   private async tryPredecodeLoop(
     generation: number,
-    onProgress?: (progress: PreloadProgress) => void,
+    onProgress?: (progress: PreparationProgress) => void,
   ): Promise<boolean> {
     const sink = new VideoSampleSink(this.videoTrack)
     const samples: VideoSample[] = []
@@ -1183,10 +1507,8 @@ class SeamlessLoopPlayer {
           this.predecodeMemoryBytes = bytes
           onProgress?.({
             fraction: Math.min(1, sample.timestamp / this.duration),
-            decodedSeconds: sample.timestamp,
-            duration: this.duration,
-            usedBytes: bytes,
-            budgetBytes: TARGET_DEVICE.fullLoopMemoryBudgetBytes,
+            detail: `${sample.timestamp.toFixed(1)} / ${this.duration.toFixed(1)} s · `
+              + `${(bytes / MIB).toFixed(0)} / ${(TARGET_DEVICE.fullLoopMemoryBudgetBytes / MIB).toFixed(0)} MiB`,
           })
           if (bytes > TARGET_DEVICE.fullLoopMemoryBudgetBytes) {
             sample.close()
@@ -1238,12 +1560,12 @@ class SeamlessLoopPlayer {
 // Application state
 // ──────────────────────────────────────────────
 
-let currentPlayer: SeamlessLoopPlayer | null = null
+let currentPlayer: LoopPlayer | null = null
 let currentInput: Input | null = null
 let loopGapIntervalId = 0
 let frameRateIntervalId = 0
 
-function updateFrameRateMonitor(player: SeamlessLoopPlayer): void {
+function updateFrameRateMonitor(player: LoopPlayer): void {
   const snapshot = player.getFrameRateSnapshot()
   renderFpsEl.textContent = snapshot.renderFps === null
     ? '—'
@@ -1281,6 +1603,7 @@ function teardown(): void {
   currentPlayer?.stop()
   currentPlayer = null
   playerContainer.classList.remove('has-video')
+  playerContainer.classList.remove('native-playback')
   resetPreloadProgress()
 
   clearInterval(loopGapIntervalId)
@@ -1344,14 +1667,32 @@ async function loadFile(file: File): Promise<void> {
     )
     playerContainer.classList.add('has-video')
 
-    const renderer = await createRenderer(canvas, videoWidth, videoHeight)
-    const player = new SeamlessLoopPlayer(
-      videoTrack, duration, videoWidth, videoHeight, renderer,
-    )
-    currentPlayer = player
+    let player: LoopPlayer
+    let nativePlayer: NativeMseLoopPlayer | null = null
     preloadStatusEl.hidden = false
-    setStatus(playbackStatus(player))
-    await player.start(progress => updatePreloadProgress(player, progress))
+    playerVideo.muted = true
+    playerVideo.playsInline = true
+
+    try {
+      playerContainer.classList.add('native-playback')
+      nativePlayer = new NativeMseLoopPlayer(playerVideo, videoTrack, duration)
+      player = nativePlayer
+      currentPlayer = player
+      setStatus(playbackStatus(player))
+      await player.start(progress => updatePreloadProgress(player, progress))
+    } catch {
+      nativePlayer?.stop()
+      playerContainer.classList.remove('native-playback')
+
+      const renderer = await createRenderer(canvas, videoWidth, videoHeight)
+      player = new SeamlessLoopPlayer(
+        videoTrack, duration, videoWidth, videoHeight, renderer,
+      )
+      currentPlayer = player
+      setStatus(`Preparing playback (${player.rendererBackend})`)
+      await player.start(progress => updatePreloadProgress(player, progress))
+    }
+
     if (currentPlayer !== player) return
     resetPreloadProgress()
     setStatus(playbackStatus(player))
